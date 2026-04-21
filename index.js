@@ -1,4 +1,3 @@
-require('dotenv').config();
 const { Client, GatewayIntentBits, Partials, Collection, EmbedBuilder, PermissionFlagsBits, ActivityType } = require('discord.js');
 const { REST } = require('@discordjs/rest');
 const { Routes } = require('discord-api-types/v10');
@@ -18,7 +17,7 @@ const client = new Client({
 
 // ─── CONFIG ─────────────────────────────────────────────────────────────────
 const config = {
-  token: process.env.DISCORD_TOKEN,
+  token: process.env.DISCORD_TOKEN || 'YOUR_BOT_TOKEN',
   prefix: '!',
 
   // Anti-Raid thresholds
@@ -32,6 +31,12 @@ const config = {
   maxBans: 5,
   maxKicks: 5,
   maxWebhookCreates: 3,
+
+  // Anti-Spam thresholds
+  maxMessagesPerWindow: 5,       // max identical/invite messages before action
+  spamWindow: 5000,              // 5 seconds window
+  maxInviteSpam: 2,              // max discord invite links before action
+  spamMuteDuration: 10 * 60,    // mute duration in seconds (10 mins)
 
   // Log channel name (auto-detected if exists)
   logChannelName: 'mod-logs',
@@ -52,6 +57,9 @@ const raidMode = new Map();          // guildId → boolean
 const whitelist = new Map();         // guildId → Set<userId>
 const antiNukeEnabled = new Map();   // guildId → boolean
 const antiRaidEnabled = new Map();   // guildId → boolean
+const spamTracker = new Map();       // userId → { msgs: [timestamps], invites: [timestamps] }
+const mutedUsers = new Map();        // userId → timeout
+const antiSpamEnabled = new Map();   // guildId → boolean
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 function getLogChannel(guild) {
@@ -61,7 +69,8 @@ function getLogChannel(guild) {
 }
 
 async function sendLog(guild, embed) {
-  const ch = getLogChannel(guild);
+  let ch = getLogChannel(guild);
+  if (!ch) ch = await ensureModLogsChannel(guild);
   if (ch) await ch.send({ embeds: [embed] }).catch(() => {});
 }
 
@@ -114,7 +123,123 @@ async function punishNuker(guild, userId, reason) {
   }
 }
 
-// ─── ANTI-RAID: Join tracking ────────────────────────────────────────────────
+// ─── ANTI-SPAM: Invite links & message spam ───────────────────────────────────
+const INVITE_REGEX = /(discord\.gg|discord\.com\/invite|discordapp\.com\/invite)\/[a-zA-Z0-9]+/gi;
+const URL_REGEX = /https?:\/\/[^\s]+/gi;
+
+client.on('messageCreate', async message => {
+  if (!message.guild) return;
+  if (message.author.bot) return;
+  if (isWhitelisted(message.guild, message.author.id)) return;
+  if (antiSpamEnabled.get(message.guild.id) === false) return; // default ON
+
+  // Skip admins and moderators
+  const member = message.member;
+  if (!member) return;
+  if (member.permissions.has(PermissionFlagsBits.ManageMessages)) return;
+
+  const content = message.content;
+  const userId = message.author.id;
+  const guildId = message.guild.id;
+  const now = Date.now();
+
+  // Init tracker for this user
+  if (!spamTracker.has(userId)) spamTracker.set(userId, { msgs: [], invites: [] });
+  const tracker = spamTracker.get(userId);
+
+  // Clean old entries
+  tracker.msgs = tracker.msgs.filter(t => now - t < config.spamWindow);
+  tracker.invites = tracker.invites.filter(t => now - t < config.spamWindow);
+
+  // ── Check for Discord invite links ─────────────────────────────────────────
+  const inviteMatches = content.match(INVITE_REGEX);
+  if (inviteMatches) {
+    tracker.invites.push(now);
+
+    // Delete the message immediately
+    await message.delete().catch(() => {});
+
+    if (tracker.invites.length >= config.maxInviteSpam) {
+      // Timeout / mute the user
+      await muteUser(message.guild, member, `Invite link spam (${tracker.invites.length} invite links in ${config.spamWindow / 1000}s)`);
+      tracker.invites = []; // reset
+    } else {
+      // First offense — just warn
+      const warn = await message.channel.send({
+        content: `<@${userId}> ⚠️ **No advertising!** Sending Discord invite links is not allowed.`
+      }).catch(() => null);
+      if (warn) setTimeout(() => warn.delete().catch(() => {}), 5000);
+    }
+
+    const embed = new EmbedBuilder()
+      .setTitle('🔗 Invite Link Detected')
+      .setColor(0xff6600)
+      .addFields(
+        { name: 'User', value: `<@${userId}> (${userId})`, inline: true },
+        { name: 'Channel', value: `<#${message.channel.id}>`, inline: true },
+        { name: 'Link Found', value: inviteMatches.join(', ').slice(0, 200), inline: false },
+        { name: 'Offense #', value: `${tracker.invites.length + 1}`, inline: true },
+        { name: 'Action', value: tracker.invites.length >= config.maxInviteSpam ? '🔇 Muted 10 mins' : '🗑️ Message Deleted', inline: true },
+      )
+      .setTimestamp();
+    await sendLog(message.guild, embed);
+    return;
+  }
+
+  // ── Check for message spam (same message repeated fast) ────────────────────
+  tracker.msgs.push(now);
+  if (tracker.msgs.length >= config.maxMessagesPerWindow) {
+    await message.delete().catch(() => {});
+    await muteUser(message.guild, member, `Message spam (${tracker.msgs.length} messages in ${config.spamWindow / 1000}s)`);
+    tracker.msgs = [];
+
+    const embed = new EmbedBuilder()
+      .setTitle('🚫 Message Spam Detected')
+      .setColor(0xff4444)
+      .addFields(
+        { name: 'User', value: `<@${userId}> (${userId})`, inline: true },
+        { name: 'Channel', value: `<#${message.channel.id}>`, inline: true },
+        { name: 'Messages', value: `${tracker.msgs.length + 1} in ${config.spamWindow / 1000}s`, inline: true },
+        { name: 'Action', value: '🔇 Muted 10 mins', inline: true },
+      )
+      .setTimestamp();
+    await sendLog(message.guild, embed);
+  }
+});
+
+// ─── MUTE HELPER ─────────────────────────────────────────────────────────────
+async function muteUser(guild, member, reason) {
+  try {
+    // Use Discord timeout (communication disabled)
+    const until = new Date(Date.now() + config.spamMuteDuration * 1000);
+    await member.timeout(config.spamMuteDuration * 1000, `[Anti-Spam] ${reason}`);
+
+    const warn = await guild.channels.cache
+      .filter(c => c.isTextBased() && !c.name.includes('mod-logs') && !c.name.includes('staff'))
+      .first()
+      ?.send({ content: `🔇 <@${member.id}> has been **muted for 10 minutes** for: ${reason}` })
+      .catch(() => null);
+    if (warn) setTimeout(() => warn?.delete().catch(() => {}), 8000);
+
+    const embed = new EmbedBuilder()
+      .setTitle('🔇 User Muted')
+      .setColor(0xff4444)
+      .addFields(
+        { name: 'User', value: `<@${member.id}> (${member.id})`, inline: true },
+        { name: 'Reason', value: reason, inline: true },
+        { name: 'Duration', value: `${config.spamMuteDuration / 60} minutes`, inline: true },
+        { name: 'Unmuted At', value: until.toLocaleString(), inline: false },
+      )
+      .setTimestamp();
+    await sendLog(guild, embed);
+  } catch (e) {
+    console.error('muteUser error:', e);
+  }
+}
+
+
+
+
 client.on('guildMemberAdd', async member => {
   if (!isAntiRaidEnabled(member.guild.id)) return;
 
@@ -265,8 +390,15 @@ const commands = [
     description: '📋 Show all bot commands and info',
   },
   {
-    name: 'antinuke',
-    description: '🔒 Toggle Anti-Nuke protection',
+    name: 'antispam',
+    description: '🚫 Toggle Anti-Spam protection (invite links & message spam)',
+    options: [{
+      name: 'toggle',
+      description: 'Enable or disable',
+      type: 3, required: true,
+      choices: [{ name: 'Enable', value: 'on' }, { name: 'Disable', value: 'off' }]
+    }]
+  },
     options: [{
       name: 'toggle',
       description: 'Enable or disable',
@@ -322,9 +454,44 @@ const commands = [
   },
 ];
 
+// ─── AUTO-CREATE PRIVATE #mod-logs ───────────────────────────────────────────
+async function ensureModLogsChannel(guild) {
+  let ch = guild.channels.cache.find(c => c.name === config.logChannelName && c.isTextBased());
+  if (ch) {
+    // Make sure it's private (deny @everyone view)
+    await ch.permissionOverwrites.edit(guild.roles.everyone, { ViewChannel: false }).catch(() => {});
+    return ch;
+  }
+
+  // Create it if it doesn't exist
+  ch = await guild.channels.create({
+    name: config.logChannelName,
+    type: 0, // GUILD_TEXT
+    permissionOverwrites: [
+      {
+        id: guild.roles.everyone.id,
+        deny: ['ViewChannel'],
+      },
+      {
+        id: guild.members.me.id,
+        allow: ['ViewChannel', 'SendMessages', 'EmbedLinks'],
+      },
+    ],
+    topic: '🔒 Private security logs — GuardBot anti-raid & anti-nuke events.',
+    reason: 'GuardBot: auto-created private mod-logs channel',
+  }).catch(() => null);
+
+  return ch;
+}
+
 // ─── READY ───────────────────────────────────────────────────────────────────
-client.once('clientReady', async () => {
+client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
+
+  // Ensure private mod-logs exists in every guild
+  for (const guild of client.guilds.cache.values()) {
+    await ensureModLogsChannel(guild);
+  }
 
   // Set bio / presence rotation
   let i = 0;
@@ -362,6 +529,7 @@ client.on('interactionCreate', async interaction => {
       .addFields(
         { name: '🔒 Anti-Nuke', value: '`/antinuke on|off` — Toggle nuke protection\n`/whitelist @user` — Whitelist a trusted user\n`/unwhitelist @user` — Remove whitelist', inline: false },
         { name: '🛡️ Anti-Raid', value: '`/antiraid on|off` — Toggle raid protection\n`/raidmode on|off` — Manually enable raid lockdown', inline: false },
+        { name: '🚫 Anti-Spam', value: '`/antispam on|off` — Toggle spam & invite link protection', inline: false },
         { name: '📊 Info', value: '`/status` — View protection status\n`/bio` — About the bot\n`/help` — This menu', inline: false },
         { name: '⚙️ Thresholds (defaults)', value: `• Raid trigger: **${config.joinRateLimit} joins** in ${config.joinRateWindow / 1000}s\n• Nuke trigger: **${config.maxBans} bans**, **${config.maxChannelDeletes} ch-deletes**, **${config.maxRoleDeletes} role-deletes** per minute`, inline: false }
       )
@@ -403,6 +571,7 @@ client.on('interactionCreate', async interaction => {
       .addFields(
         { name: '🛡️ Anti-Raid', value: raidEnabled ? '✅ Enabled' : '❌ Disabled', inline: true },
         { name: '🔒 Anti-Nuke', value: nukeEnabled ? '✅ Enabled' : '❌ Disabled', inline: true },
+        { name: '🚫 Anti-Spam', value: antiSpamEnabled.get(guild.id) !== false ? '✅ Enabled' : '❌ Disabled', inline: true },
         { name: '🚨 Raid Mode', value: inRaid ? '🔴 ACTIVE' : '🟢 Inactive', inline: true },
         { name: '✅ Whitelisted Users', value: wl.size > 0 ? [...wl].map(id => `<@${id}>`).join(', ') : 'None', inline: false },
       )
@@ -413,6 +582,18 @@ client.on('interactionCreate', async interaction => {
   // Admin-only commands below
   if (!isAdmin) {
     return interaction.reply({ content: '❌ You need **Administrator** permission to use this command.', ephemeral: true });
+  }
+
+  // /antispam
+  if (commandName === 'antispam') {
+    const val = interaction.options.getString('toggle') === 'on';
+    antiSpamEnabled.set(guild.id, val);
+    return interaction.reply({
+      embeds: [new EmbedBuilder()
+        .setColor(val ? 0x57f287 : 0xff4444)
+        .setDescription(`🚫 Anti-Spam is now **${val ? 'ENABLED' : 'DISABLED'}**`)
+        .setTimestamp()]
+    });
   }
 
   // /antinuke
