@@ -428,6 +428,9 @@ const commands = [
       choices: [{ name: 'Enable', value: 'on' }, { name: 'Disable', value: 'off' }]
     }]
   },
+  {
+    name: 'antispam',
+    description: '🚫 Toggle Anti-Spam protection (invite links & message spam)',
     options: [{
       name: 'toggle',
       description: 'Enable or disable',
@@ -435,6 +438,9 @@ const commands = [
       choices: [{ name: 'Enable', value: 'on' }, { name: 'Disable', value: 'off' }]
     }]
   },
+  {
+    name: 'antinuke',
+    description: '🔒 Toggle Anti-Nuke protection',
     options: [{
       name: 'toggle',
       description: 'Enable or disable',
