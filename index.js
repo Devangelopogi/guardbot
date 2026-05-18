@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, Partials, Collection, EmbedBuilder, PermissionFlagsBits, ActivityType, AuditLogEvent } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, Collection, EmbedBuilder, PermissionFlagsBits, ActivityType, AuditLogEvent, ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType } = require('discord.js');
 const { REST } = require('@discordjs/rest');
 const { Routes } = require('discord-api-types/v10');
 
@@ -11,6 +11,7 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildWebhooks,
     GatewayIntentBits.GuildIntegrations,
+    GatewayIntentBits.GuildModeration,
   ],
   partials: [Partials.Channel, Partials.Message, Partials.GuildMember],
 });
@@ -23,31 +24,74 @@ const config = {
   // Anti-Raid thresholds
   joinRateLimit: 10,           // max joins per window
   joinRateWindow: 10000,       // window in ms (10 seconds)
-  newAccountAge: 3,            // days — flag accounts newer than this
-  newAccountKick: false,       // auto-kick new accounts? OFF by default (safe for TikTok followers)
+  newAccountAge: 7,            // days — flag accounts newer than this (increased from 3)
+  newAccountKick: false,       // auto-kick new accounts? OFF by default
 
-  // Anti-Nuke thresholds (per minute)
-  maxChannelDeletes: 3,
-  maxRoleDeletes: 3,
-  maxBans: 5,
-  maxKicks: 5,
-  maxWebhookCreates: 3,
+  // Anti-Nuke thresholds (per minute) - MORE STRICT
+  maxChannelDeletes: 2,        // reduced from 3
+  maxChannelCreates: 5,        // NEW: detect channel spam creation
+  maxRoleDeletes: 2,           // reduced from 3
+  maxRoleCreates: 5,           // NEW: detect role spam creation
+  maxBans: 3,                  // reduced from 5
+  maxKicks: 4,                 // reduced from 5
+  maxWebhookCreates: 2,        // reduced from 3
+  maxPermissionChanges: 5,     // NEW: detect permission abuse
 
-  // Anti-Spam thresholds
-  maxMessagesPerWindow: 5,       // max identical/invite messages before action
-  spamWindow: 5000,              // 5 seconds window
-  maxInviteSpam: 2,              // max discord invite links before action
-  spamMuteDuration: 10 * 60,    // mute duration in seconds (10 mins)
+  // Anti-Spam thresholds - MORE AGGRESSIVE
+  maxMessagesPerWindow: 5,       
+  spamWindow: 5000,              
+  maxInviteSpam: 1,              // reduced from 2 - ZERO TOLERANCE
+  maxMentionsPerMessage: 5,      // NEW: max mentions per message
+  maxEmojisPerMessage: 15,       // NEW: max emojis per message
+  maxCapsPercent: 70,            // NEW: max caps percentage
+  minCapsLength: 10,             // NEW: min length to check caps
+  maxLinksPerMessage: 3,         // NEW: max links per message
+  spamMuteDuration: 30 * 60,     // increased to 30 mins (from 10)
 
-  // Log channel name (auto-detected if exists)
+  // Threat Level thresholds
+  warningsBeforeMute: 2,
+  mutesBeforeKick: 2,
+  kicksBeforeBan: 2,
+
+  // Auto-Slowmode
+  autoSlowmodeThreshold: 10,     // messages per 5 seconds to trigger
+  autoSlowmodeDuration: 10,      // slowmode seconds
+
+  // Quarantine
+  quarantineRoleName: 'Quarantine',
+
+  // Log channel name
   logChannelName: 'mod-logs',
 
-  // Bot bio / status messages (rotates every 30s)
+  // Bot status messages
   statuses: [
-    { name: '🛡️ Protecting the server', type: ActivityType.Watching },
-    { name: '⚡ Anti-Raid Active', type: ActivityType.Playing },
-    { name: '🔒 Anti-Nuke Active', type: ActivityType.Playing },
+    { name: '🛡️ PROTECTING SERVER', type: ActivityType.Watching },
+    { name: '⚡ THREAT DETECTED = INSTANT BAN', type: ActivityType.Playing },
+    { name: '🔒 ZERO TOLERANCE MODE', type: ActivityType.Playing },
+    { name: '👁️ WATCHING EVERYTHING', type: ActivityType.Watching },
     { name: '/help for commands', type: ActivityType.Listening },
+    { name: '🚨 PANIC BUTTON READY', type: ActivityType.Playing },
+  ],
+
+  // Suspicious link patterns (phishing, scams)
+  suspiciousPatterns: [
+    /discord\.gift/i,
+    /discordnitro/i,
+    /free.*nitro/i,
+    /steamcommunity\.[^com]/i,
+    /steampowered\.[^com]/i,
+    /bit\.ly/i,
+    /tinyurl/i,
+    /grabify/i,
+    /iplogger/i,
+    /pornhub/i,
+    /xvideos/i,
+    /\.(ru|cn|tk|ml|ga|cf|gq)\/\S+/i,
+  ],
+
+  // Banned words (auto-delete + warn)
+  bannedWords: [
+    // Add your banned words here
   ],
 };
 
@@ -58,9 +102,17 @@ const raidMode = new Map();          // guildId → boolean
 const whitelist = new Map();         // guildId → Set<userId>
 const antiNukeEnabled = new Map();   // guildId → boolean
 const antiRaidEnabled = new Map();   // guildId → boolean
-const spamTracker = new Map();       // userId → { msgs: [timestamps], invites: [timestamps] }
-const mutedUsers = new Map();        // userId → timeout
+const spamTracker = new Map();       // odding → { msgs: [], invites: [], mentions: [], etc }
+const mutedUsers = new Map();        // odding → timeout
 const antiSpamEnabled = new Map();   // guildId → boolean
+const lockdownMode = new Map();      // guildId → boolean
+const verificationEnabled = new Map(); // guildId → boolean
+const threatLevel = new Map();       // odding → { warnings: 0, mutes: 0, kicks: 0 }
+const messageLog = new Map();        // channelId → [timestamps] for auto-slowmode
+const quarantinedUsers = new Map();  // odding → { guildId, timestamp }
+const antiLinkEnabled = new Map();   // guildId → boolean (default ON)
+const antiMentionEnabled = new Map(); // guildId → boolean (default ON)
+const dmWarningsEnabled = new Map(); // guildId → boolean (default ON)
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 function getLogChannel(guild) {
@@ -75,8 +127,8 @@ async function sendLog(guild, embed) {
   if (ch) await ch.send({ embeds: [embed] }).catch(() => {});
 }
 
-function isWhitelisted(guild, userId) {
-  return whitelist.get(guild.id)?.has(userId) || false;
+function isWhitelisted(guild, odding) {
+  return whitelist.get(guild.id)?.has(odding) || false;
 }
 
 function getActions(guildId, type) {
@@ -93,32 +145,203 @@ function trackAction(guildId, type) {
 }
 
 function isAntiNukeEnabled(guildId) {
-  return antiNukeEnabled.get(guildId) !== false; // default ON
+  return antiNukeEnabled.get(guildId) !== false;
 }
 
 function isAntiRaidEnabled(guildId) {
-  return antiRaidEnabled.get(guildId) !== false; // default ON
+  return antiRaidEnabled.get(guildId) !== false;
 }
 
-async function punishNuker(guild, userId, reason) {
-  if (isWhitelisted(guild, userId)) return;
-  try {
-    const member = await guild.members.fetch(userId).catch(() => null);
-    if (!member) return;
-    if (member.permissions.has(PermissionFlagsBits.Administrator)) return; // skip admins/owner
+function isAntiSpamEnabled(guildId) {
+  return antiSpamEnabled.get(guildId) !== false;
+}
 
-    await member.ban({ reason: `[Anti-Nuke] ${reason}`, deleteMessageSeconds: 0 });
+function isAntiLinkEnabled(guildId) {
+  return antiLinkEnabled.get(guildId) !== false;
+}
+
+function isAntiMentionEnabled(guildId) {
+  return antiMentionEnabled.get(guildId) !== false;
+}
+
+function isDmWarningsEnabled(guildId) {
+  return dmWarningsEnabled.get(guildId) !== false;
+}
+
+// ─── THREAT LEVEL SYSTEM ─────────────────────────────────────────────────────
+function getThreatLevel(odding) {
+  if (!threatLevel.has(odding)) {
+    threatLevel.set(odding, { warnings: 0, mutes: 0, kicks: 0, lastAction: Date.now() });
+  }
+  return threatLevel.get(odding);
+}
+
+function incrementThreat(odding, type) {
+  const threat = getThreatLevel(odding);
+  threat[type]++;
+  threat.lastAction = Date.now();
+  return threat;
+}
+
+function getThreatScore(odding) {
+  const threat = getThreatLevel(odding);
+  return threat.warnings + (threat.mutes * 3) + (threat.kicks * 5);
+}
+
+// ─── DM WARNING SYSTEM ───────────────────────────────────────────────────────
+async function sendDMWarning(user, guild, reason, action) {
+  if (!isDmWarningsEnabled(guild.id)) return;
+  
+  const embed = new EmbedBuilder()
+    .setColor(action === 'ban' ? 0xff0000 : action === 'kick' ? 0xff6600 : 0xffcc00)
+    .setAuthor({ name: `⚠️ Warning from ${guild.name}` })
+    .setDescription(`You have received a **${action.toUpperCase()}** from **${guild.name}**`)
+    .addFields(
+      { name: 'Reason', value: reason },
+      { name: 'Threat Score', value: `${getThreatScore(user.id)}`, inline: true },
+    )
+    .setFooter({ text: 'GuardBot Security System' })
+    .setTimestamp();
+
+  try {
+    await user.send({ embeds: [embed] });
+  } catch (e) {
+    // User has DMs disabled
+  }
+}
+
+// ─── QUARANTINE SYSTEM ───────────────────────────────────────────────────────
+async function ensureQuarantineRole(guild) {
+  let role = guild.roles.cache.find(r => r.name === config.quarantineRoleName);
+  
+  if (!role) {
+    role = await guild.roles.create({
+      name: config.quarantineRoleName,
+      color: 0x808080,
+      permissions: [],
+      reason: 'GuardBot: Auto-created quarantine role',
+    }).catch(() => null);
+
+    if (role) {
+      // Deny all permissions in all channels
+      for (const channel of guild.channels.cache.values()) {
+        await channel.permissionOverwrites.edit(role, {
+          ViewChannel: false,
+          SendMessages: false,
+          AddReactions: false,
+          Speak: false,
+        }).catch(() => {});
+      }
+    }
+  }
+  
+  return role;
+}
+
+async function quarantineUser(guild, member, reason) {
+  const role = await ensureQuarantineRole(guild);
+  if (!role) return false;
+
+  try {
+    await member.roles.add(role, `[Quarantine] ${reason}`);
+    quarantinedUsers.set(member.id, { guildId: guild.id, timestamp: Date.now() });
+
+    const embed = new EmbedBuilder()
+      .setColor(0x808080)
+      .setAuthor({ name: '🔒 USER QUARANTINED' })
+      .setDescription('```diff\n- User has been isolated from the server\n```')
+      .addFields(
+        { name: 'User', value: `<@${member.id}> · \`${member.id}\``, inline: true },
+        { name: 'Reason', value: reason, inline: true },
+        { name: 'Action', value: 'Use `/unquarantine` to release', inline: false },
+      )
+      .setFooter({ text: 'guardbot · quarantine system' })
+      .setTimestamp();
+    await sendLog(guild, embed);
+
+    await sendDMWarning(member.user, guild, reason, 'quarantine');
+    return true;
+  } catch (e) {
+    console.error('quarantineUser error:', e);
+    return false;
+  }
+}
+
+// ─── LOCKDOWN SYSTEM ─────────────────────────────────────────────────────────
+async function toggleLockdown(guild, enable) {
+  lockdownMode.set(guild.id, enable);
+  
+  const everyone = guild.roles.everyone;
+  
+  for (const channel of guild.channels.cache.values()) {
+    if (channel.type === ChannelType.GuildText || channel.type === ChannelType.GuildVoice) {
+      try {
+        await channel.permissionOverwrites.edit(everyone, {
+          SendMessages: enable ? false : null,
+          Speak: enable ? false : null,
+          AddReactions: enable ? false : null,
+        });
+      } catch (e) {}
+    }
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(enable ? 0xff0000 : 0x00ff00)
+    .setAuthor({ name: enable ? '🚨 SERVER LOCKDOWN ACTIVATED' : '✅ LOCKDOWN LIFTED' })
+    .setDescription(enable 
+      ? '```diff\n- ALL CHANNELS LOCKED\n- NO ONE CAN SEND MESSAGES\n- EMERGENCY MODE ACTIVE\n```'
+      : '```diff\n+ Server restored to normal\n+ All channels unlocked\n```')
+    .setFooter({ text: 'guardbot · lockdown system' })
+    .setTimestamp();
+  await sendLog(guild, embed);
+}
+
+// ─── PUNISH NUKER (ENHANCED) ─────────────────────────────────────────────────
+async function punishNuker(guild, odding, reason) {
+  if (isWhitelisted(guild, odding)) return;
+  
+  try {
+    const member = await guild.members.fetch(odding).catch(() => null);
+    if (!member) return;
+    
+    // Skip server owner
+    if (member.id === guild.ownerId) return;
+    
+    // Check if admin - quarantine instead of ban
+    if (member.permissions.has(PermissionFlagsBits.Administrator)) {
+      // Remove all roles first (strip permissions)
+      const rolesToRemove = member.roles.cache.filter(r => r.id !== guild.id);
+      await member.roles.remove(rolesToRemove, `[Anti-Nuke] ${reason}`).catch(() => {});
+      await quarantineUser(guild, member, reason);
+      
+      const embed = new EmbedBuilder()
+        .setColor(0xff0000)
+        .setAuthor({ name: '⚠️ ADMIN COMPROMISED - PERMISSIONS STRIPPED' })
+        .setDescription('```diff\n- Admin attempted nuke\n- All roles removed\n- User quarantined\n```')
+        .addFields(
+          { name: 'User', value: `<@${odding}> · \`${odding}\``, inline: true },
+          { name: 'Reason', value: reason, inline: true },
+        )
+        .setFooter({ text: 'guardbot · anti-nuke' })
+        .setTimestamp();
+      await sendLog(guild, embed);
+      return;
+    }
+
+    // Non-admin: instant ban
+    await sendDMWarning(member.user, guild, reason, 'ban');
+    await member.ban({ reason: `[Anti-Nuke] ${reason}`, deleteMessageSeconds: 604800 }); // Delete 7 days of messages
 
     const embed = new EmbedBuilder()
       .setColor(0xff0000)
-      .setAuthor({ name: '⬡  anti-nuke triggered' })
-      .setDescription('```diff\n-  nuke attempt detected & neutralized\n```')
+      .setAuthor({ name: '⬡ ANTI-NUKE TRIGGERED' })
+      .setDescription('```diff\n- NUKE ATTEMPT DETECTED & NEUTRALIZED\n```')
       .addFields(
-        { name: 'user',   value: `<@${userId}> · \`${userId}\``, inline: true },
-        { name: 'reason', value: reason, inline: true },
-        { name: 'action', value: '```diff\n-  banned\n```', inline: true },
+        { name: 'User', value: `<@${odding}> · \`${odding}\``, inline: true },
+        { name: 'Reason', value: reason, inline: true },
+        { name: 'Action', value: '```diff\n- BANNED + 7 DAY MSG PURGE\n```', inline: true },
       )
-      .setFooter({ text: 'guardbot  ·  anti-nuke' })
+      .setFooter({ text: 'guardbot · anti-nuke' })
       .setTimestamp();
     await sendLog(guild, embed);
   } catch (e) {
@@ -126,116 +349,66 @@ async function punishNuker(guild, userId, reason) {
   }
 }
 
-// ─── ANTI-SPAM: Invite links & message spam ───────────────────────────────────
-const INVITE_REGEX = /(discord\.gg|discord\.com\/invite|discordapp\.com\/invite)\/[a-zA-Z0-9]+/gi;
-const URL_REGEX = /https?:\/\/[^\s]+/gi;
-
-client.on('messageCreate', async message => {
-  if (!message.guild) return;
-  if (message.author.bot) return;
-  if (isWhitelisted(message.guild, message.author.id)) return;
-  if (antiSpamEnabled.get(message.guild.id) === false) return; // default ON
-
-  // Skip admins and moderators
-  const member = message.member;
-  if (!member) return;
-  if (member.permissions.has(PermissionFlagsBits.ManageMessages)) return;
-
-  const content = message.content;
-  const userId = message.author.id;
-  const guildId = message.guild.id;
-  const now = Date.now();
-
-  // Init tracker for this user
-  if (!spamTracker.has(userId)) spamTracker.set(userId, { msgs: [], invites: [] });
-  const tracker = spamTracker.get(userId);
-
-  // Clean old entries
-  tracker.msgs = tracker.msgs.filter(t => now - t < config.spamWindow);
-  tracker.invites = tracker.invites.filter(t => now - t < config.spamWindow);
-
-  // ── Check for Discord invite links ─────────────────────────────────────────
-  const inviteMatches = content.match(INVITE_REGEX);
-  if (inviteMatches) {
-    tracker.invites.push(now);
-
-    // Delete the message immediately
-    await message.delete().catch(() => {});
-
-    if (tracker.invites.length >= config.maxInviteSpam) {
-      // Timeout / mute the user
-      await muteUser(message.guild, member, `Invite link spam (${tracker.invites.length} invite links in ${config.spamWindow / 1000}s)`);
-      tracker.invites = []; // reset
-    } else {
-      // First offense — just warn
-      const warn = await message.channel.send({
-        content: `<@${userId}> ⚠️ **No advertising!** Sending Discord invite links is not allowed.`
-      }).catch(() => null);
-      if (warn) setTimeout(() => warn.delete().catch(() => {}), 5000);
+// ─── ENHANCED MUTE SYSTEM ────────────────────────────────────────────────────
+async function muteUser(guild, member, reason, duration = config.spamMuteDuration) {
+  const threat = incrementThreat(member.id, 'mutes');
+  
+  // Check if should escalate to kick/ban
+  if (threat.mutes >= config.mutesBeforeKick) {
+    if (threat.kicks >= config.kicksBeforeBan) {
+      // BAN
+      await sendDMWarning(member.user, guild, `${reason} (Repeated violations)`, 'ban');
+      await member.ban({ reason: `[Anti-Spam] Repeated violations: ${reason}`, deleteMessageSeconds: 86400 }).catch(() => {});
+      
+      const embed = new EmbedBuilder()
+        .setColor(0xff0000)
+        .setAuthor({ name: '🔨 USER BANNED - REPEATED VIOLATIONS' })
+        .addFields(
+          { name: 'User', value: `<@${member.id}> · \`${member.id}\``, inline: true },
+          { name: 'Reason', value: reason, inline: true },
+          { name: 'Threat Score', value: `${getThreatScore(member.id)}`, inline: true },
+        )
+        .setFooter({ text: 'guardbot · threat escalation' })
+        .setTimestamp();
+      await sendLog(guild, embed);
+      return;
     }
-
+    
+    // KICK
+    incrementThreat(member.id, 'kicks');
+    await sendDMWarning(member.user, guild, `${reason} (Multiple mutes)`, 'kick');
+    await member.kick(`[Anti-Spam] Multiple mutes: ${reason}`).catch(() => {});
+    
     const embed = new EmbedBuilder()
       .setColor(0xff6600)
-      .setAuthor({ name: '⬡  anti-spam  ·  invite link detected' })
+      .setAuthor({ name: '👢 USER KICKED - MULTIPLE MUTES' })
       .addFields(
-        { name: 'user',      value: `<@${userId}> · \`${userId}\``, inline: true },
-        { name: 'channel',   value: `<#${message.channel.id}>`, inline: true },
-        { name: 'link',      value: `\`${inviteMatches.join(', ').slice(0, 200)}\``, inline: false },
-        { name: 'offense',   value: `#${tracker.invites.length + 1}`, inline: true },
-        { name: 'action',    value: tracker.invites.length >= config.maxInviteSpam ? '```diff\n-  muted 10 mins\n```' : '```diff\n-  message deleted\n```', inline: true },
+        { name: 'User', value: `<@${member.id}> · \`${member.id}\``, inline: true },
+        { name: 'Reason', value: reason, inline: true },
+        { name: 'Mute Count', value: `${threat.mutes}`, inline: true },
       )
-      .setFooter({ text: 'guardbot  ·  anti-spam' })
+      .setFooter({ text: 'guardbot · threat escalation' })
       .setTimestamp();
-    await sendLog(message.guild, embed);
+    await sendLog(guild, embed);
     return;
   }
 
-  // ── Check for message spam (same message repeated fast) ────────────────────
-  tracker.msgs.push(now);
-  if (tracker.msgs.length >= config.maxMessagesPerWindow) {
-    await message.delete().catch(() => {});
-    await muteUser(message.guild, member, `Message spam (${tracker.msgs.length} messages in ${config.spamWindow / 1000}s)`);
-    tracker.msgs = [];
-
-    const embed = new EmbedBuilder()
-      .setColor(0xff0000)
-      .setAuthor({ name: '⬡  anti-spam  ·  message spam detected' })
-      .addFields(
-        { name: 'user',     value: `<@${userId}> · \`${userId}\``, inline: true },
-        { name: 'channel',  value: `<#${message.channel.id}>`, inline: true },
-        { name: 'count',    value: `${tracker.msgs.length + 1} msgs / ${config.spamWindow / 1000}s`, inline: true },
-        { name: 'action',   value: '```diff\n-  muted 10 mins\n```', inline: true },
-      )
-      .setFooter({ text: 'guardbot  ·  anti-spam' })
-      .setTimestamp();
-    await sendLog(message.guild, embed);
-  }
-});
-
-// ─── MUTE HELPER ─────────────────────────────────────────────────────────────
-async function muteUser(guild, member, reason) {
   try {
-    // Use Discord timeout (communication disabled)
-    const until = new Date(Date.now() + config.spamMuteDuration * 1000);
-    await member.timeout(config.spamMuteDuration * 1000, `[Anti-Spam] ${reason}`);
-
-    const warn = await guild.channels.cache
-      .filter(c => c.isTextBased() && !c.name.includes('mod-logs') && !c.name.includes('staff'))
-      .first()
-      ?.send({ content: `🔇 <@${member.id}> has been **muted for 10 minutes** for: ${reason}` })
-      .catch(() => null);
-    if (warn) setTimeout(() => warn?.delete().catch(() => {}), 8000);
+    const until = new Date(Date.now() + duration * 1000);
+    await member.timeout(duration * 1000, `[Anti-Spam] ${reason}`);
+    await sendDMWarning(member.user, guild, reason, 'mute');
 
     const embed = new EmbedBuilder()
-      .setColor(0xff0000)
-      .setAuthor({ name: '⬡  user muted' })
+      .setColor(0xff6600)
+      .setAuthor({ name: '🔇 USER MUTED' })
       .addFields(
-        { name: 'user',       value: `<@${member.id}> · \`${member.id}\``, inline: true },
-        { name: 'reason',     value: reason, inline: true },
-        { name: 'duration',   value: `${config.spamMuteDuration / 60} minutes`, inline: true },
-        { name: 'unmuted at', value: until.toLocaleString(), inline: false },
+        { name: 'User', value: `<@${member.id}> · \`${member.id}\``, inline: true },
+        { name: 'Reason', value: reason, inline: true },
+        { name: 'Duration', value: `${duration / 60} minutes`, inline: true },
+        { name: 'Threat Score', value: `${getThreatScore(member.id)}`, inline: true },
+        { name: 'Mute #', value: `${threat.mutes}/${config.mutesBeforeKick} before kick`, inline: true },
       )
-      .setFooter({ text: 'guardbot  ·  anti-spam' })
+      .setFooter({ text: 'guardbot · anti-spam' })
       .setTimestamp();
     await sendLog(guild, embed);
   } catch (e) {
@@ -243,9 +416,294 @@ async function muteUser(guild, member, reason) {
   }
 }
 
+// ─── AUTO-SLOWMODE ───────────────────────────────────────────────────────────
+async function checkAutoSlowmode(channel) {
+  const channelId = channel.id;
+  const now = Date.now();
+  
+  if (!messageLog.has(channelId)) messageLog.set(channelId, []);
+  const msgs = messageLog.get(channelId);
+  msgs.push(now);
+  
+  // Clean old (keep last 5 seconds)
+  const recent = msgs.filter(t => now - t < 5000);
+  messageLog.set(channelId, recent);
+  
+  if (recent.length >= config.autoSlowmodeThreshold && channel.rateLimitPerUser < config.autoSlowmodeDuration) {
+    await channel.setRateLimitPerUser(config.autoSlowmodeDuration, '[GuardBot] Auto-slowmode triggered').catch(() => {});
+    
+    const embed = new EmbedBuilder()
+      .setColor(0xffcc00)
+      .setAuthor({ name: '🐌 AUTO-SLOWMODE ACTIVATED' })
+      .addFields(
+        { name: 'Channel', value: `<#${channel.id}>`, inline: true },
+        { name: 'Duration', value: `${config.autoSlowmodeDuration}s`, inline: true },
+        { name: 'Trigger', value: `${recent.length} msgs/5s`, inline: true },
+      )
+      .setFooter({ text: 'guardbot · auto-slowmode' })
+      .setTimestamp();
+    await sendLog(channel.guild, embed);
+    
+    // Auto-disable after 2 minutes
+    setTimeout(async () => {
+      if (channel.rateLimitPerUser === config.autoSlowmodeDuration) {
+        await channel.setRateLimitPerUser(0, '[GuardBot] Auto-slowmode expired').catch(() => {});
+      }
+    }, 120000);
+  }
+}
 
+// ─── REGEX PATTERNS ──────────────────────────────────────────────────────────
+const INVITE_REGEX = /(discord\.gg|discord\.com\/invite|discordapp\.com\/invite|dsc\.gg)\/[a-zA-Z0-9]+/gi;
+const URL_REGEX = /https?:\/\/[^\s]+/gi;
+const MENTION_REGEX = /<@[!&]?\d+>|@everyone|@here/g;
+const EMOJI_REGEX = /<a?:\w+:\d+>|[\u{1F300}-\u{1F9FF}]|[\u{2600}-\u{26FF}]|[\u{2700}-\u{27BF}]/gu;
 
+// ─── ANTI-SPAM MESSAGE HANDLER ───────────────────────────────────────────────
+client.on('messageCreate', async message => {
+  if (!message.guild) return;
+  if (message.author.bot) return;
+  if (isWhitelisted(message.guild, message.author.id)) return;
+  
+  const member = message.member;
+  if (!member) return;
+  
+  // Skip admins and moderators
+  if (member.permissions.has(PermissionFlagsBits.ManageMessages)) return;
+  
+  // Check lockdown
+  if (lockdownMode.get(message.guild.id)) {
+    await message.delete().catch(() => {});
+    return;
+  }
 
+  const content = message.content;
+  const odding = message.author.id;
+  const guildId = message.guild.id;
+  const now = Date.now();
+
+  // Auto-slowmode check
+  await checkAutoSlowmode(message.channel);
+
+  // Init tracker
+  if (!spamTracker.has(odding)) {
+    spamTracker.set(odding, { msgs: [], invites: [], mentions: [], links: [], content: [] });
+  }
+  const tracker = spamTracker.get(odding);
+  
+  // Clean old entries
+  Object.keys(tracker).forEach(key => {
+    if (Array.isArray(tracker[key])) {
+      tracker[key] = tracker[key].filter(t => typeof t === 'number' ? now - t < config.spamWindow : now - t.time < config.spamWindow);
+    }
+  });
+
+  // ── BANNED WORDS CHECK ─────────────────────────────────────────────────────
+  if (config.bannedWords.length > 0) {
+    const lowerContent = content.toLowerCase();
+    const hasBannedWord = config.bannedWords.some(word => lowerContent.includes(word.toLowerCase()));
+    if (hasBannedWord) {
+      await message.delete().catch(() => {});
+      incrementThreat(odding, 'warnings');
+      
+      const embed = new EmbedBuilder()
+        .setColor(0xff0000)
+        .setAuthor({ name: '🚫 BANNED WORD DETECTED' })
+        .addFields(
+          { name: 'User', value: `<@${odding}>`, inline: true },
+          { name: 'Channel', value: `<#${message.channel.id}>`, inline: true },
+        )
+        .setFooter({ text: 'guardbot · content filter' })
+        .setTimestamp();
+      await sendLog(message.guild, embed);
+      return;
+    }
+  }
+
+  // ── SUSPICIOUS LINKS CHECK ─────────────────────────────────────────────────
+  if (isAntiLinkEnabled(guildId)) {
+    const isSuspicious = config.suspiciousPatterns.some(pattern => pattern.test(content));
+    if (isSuspicious) {
+      await message.delete().catch(() => {});
+      await muteUser(message.guild, member, 'Suspicious/phishing link detected', config.spamMuteDuration * 2);
+      
+      const embed = new EmbedBuilder()
+        .setColor(0xff0000)
+        .setAuthor({ name: '🎣 PHISHING LINK DETECTED' })
+        .setDescription('```diff\n- Potential scam/phishing link blocked\n```')
+        .addFields(
+          { name: 'User', value: `<@${odding}>`, inline: true },
+          { name: 'Channel', value: `<#${message.channel.id}>`, inline: true },
+          { name: 'Action', value: 'Muted 1 hour', inline: true },
+        )
+        .setFooter({ text: 'guardbot · anti-phishing' })
+        .setTimestamp();
+      await sendLog(message.guild, embed);
+      return;
+    }
+  }
+
+  // ── DISCORD INVITE LINKS ───────────────────────────────────────────────────
+  if (isAntiSpamEnabled(guildId)) {
+    const inviteMatches = content.match(INVITE_REGEX);
+    if (inviteMatches) {
+      tracker.invites.push(now);
+      await message.delete().catch(() => {});
+
+      if (tracker.invites.length >= config.maxInviteSpam) {
+        await muteUser(message.guild, member, `Invite link spam (${tracker.invites.length} links)`);
+        tracker.invites = [];
+      } else {
+        incrementThreat(odding, 'warnings');
+        const warn = await message.channel.send({
+          content: `<@${odding}> ⚠️ **NO ADVERTISING!** Discord invite links are NOT allowed.`
+        }).catch(() => null);
+        if (warn) setTimeout(() => warn.delete().catch(() => {}), 5000);
+      }
+
+      const embed = new EmbedBuilder()
+        .setColor(0xff6600)
+        .setAuthor({ name: '⬡ INVITE LINK BLOCKED' })
+        .addFields(
+          { name: 'User', value: `<@${odding}>`, inline: true },
+          { name: 'Channel', value: `<#${message.channel.id}>`, inline: true },
+          { name: 'Threat Score', value: `${getThreatScore(odding)}`, inline: true },
+        )
+        .setFooter({ text: 'guardbot · anti-spam' })
+        .setTimestamp();
+      await sendLog(message.guild, embed);
+      return;
+    }
+  }
+
+  // ── MASS MENTION CHECK ─────────────────────────────────────────────────────
+  if (isAntiMentionEnabled(guildId)) {
+    const mentions = content.match(MENTION_REGEX) || [];
+    const hasEveryoneHere = content.includes('@everyone') || content.includes('@here');
+    
+    if (hasEveryoneHere && !member.permissions.has(PermissionFlagsBits.MentionEveryone)) {
+      await message.delete().catch(() => {});
+      await muteUser(message.guild, member, 'Attempted @everyone/@here mention', config.spamMuteDuration * 2);
+      
+      const embed = new EmbedBuilder()
+        .setColor(0xff0000)
+        .setAuthor({ name: '📢 MASS MENTION ATTEMPT BLOCKED' })
+        .addFields(
+          { name: 'User', value: `<@${odding}>`, inline: true },
+          { name: 'Attempted', value: '@everyone/@here', inline: true },
+        )
+        .setFooter({ text: 'guardbot · anti-mention' })
+        .setTimestamp();
+      await sendLog(message.guild, embed);
+      return;
+    }
+
+    if (mentions.length > config.maxMentionsPerMessage) {
+      await message.delete().catch(() => {});
+      tracker.mentions.push(now);
+      
+      if (tracker.mentions.length >= 2) {
+        await muteUser(message.guild, member, `Mass mention spam (${mentions.length} mentions)`);
+        tracker.mentions = [];
+      } else {
+        incrementThreat(odding, 'warnings');
+      }
+
+      const embed = new EmbedBuilder()
+        .setColor(0xff6600)
+        .setAuthor({ name: '📢 MASS MENTION BLOCKED' })
+        .addFields(
+          { name: 'User', value: `<@${odding}>`, inline: true },
+          { name: 'Mentions', value: `${mentions.length}`, inline: true },
+        )
+        .setFooter({ text: 'guardbot · anti-mention' })
+        .setTimestamp();
+      await sendLog(message.guild, embed);
+      return;
+    }
+  }
+
+  // ── EMOJI SPAM CHECK ───────────────────────────────────────────────────────
+  if (isAntiSpamEnabled(guildId)) {
+    const emojis = content.match(EMOJI_REGEX) || [];
+    if (emojis.length > config.maxEmojisPerMessage) {
+      await message.delete().catch(() => {});
+      incrementThreat(odding, 'warnings');
+      
+      const embed = new EmbedBuilder()
+        .setColor(0xffcc00)
+        .setAuthor({ name: '😀 EMOJI SPAM BLOCKED' })
+        .addFields(
+          { name: 'User', value: `<@${odding}>`, inline: true },
+          { name: 'Emoji Count', value: `${emojis.length}`, inline: true },
+        )
+        .setFooter({ text: 'guardbot · anti-spam' })
+        .setTimestamp();
+      await sendLog(message.guild, embed);
+      return;
+    }
+  }
+
+  // ── CAPS SPAM CHECK ────────────────────────────────────────────────────────
+  if (isAntiSpamEnabled(guildId) && content.length >= config.minCapsLength) {
+    const letters = content.replace(/[^a-zA-Z]/g, '');
+    if (letters.length > 0) {
+      const capsCount = letters.replace(/[^A-Z]/g, '').length;
+      const capsPercent = (capsCount / letters.length) * 100;
+      
+      if (capsPercent >= config.maxCapsPercent) {
+        await message.delete().catch(() => {});
+        incrementThreat(odding, 'warnings');
+        
+        const warn = await message.channel.send({
+          content: `<@${odding}> ⚠️ Please don't use excessive CAPS.`
+        }).catch(() => null);
+        if (warn) setTimeout(() => warn.delete().catch(() => {}), 5000);
+        return;
+      }
+    }
+  }
+
+  // ── LINK SPAM CHECK ────────────────────────────────────────────────────────
+  if (isAntiLinkEnabled(guildId)) {
+    const links = content.match(URL_REGEX) || [];
+    if (links.length > config.maxLinksPerMessage) {
+      await message.delete().catch(() => {});
+      tracker.links.push(now);
+      
+      if (tracker.links.length >= 2) {
+        await muteUser(message.guild, member, `Link spam (${links.length} links in message)`);
+        tracker.links = [];
+      } else {
+        incrementThreat(odding, 'warnings');
+      }
+      return;
+    }
+  }
+
+  // ── DUPLICATE MESSAGE SPAM ─────────────────────────────────────────────────
+  if (isAntiSpamEnabled(guildId)) {
+    tracker.content.push({ text: content, time: now });
+    const recentDuplicates = tracker.content.filter(m => m.text === content);
+    
+    if (recentDuplicates.length >= 3) {
+      await message.delete().catch(() => {});
+      await muteUser(message.guild, member, 'Duplicate message spam');
+      tracker.content = [];
+      return;
+    }
+
+    // General message rate
+    tracker.msgs.push(now);
+    if (tracker.msgs.length >= config.maxMessagesPerWindow) {
+      await message.delete().catch(() => {});
+      await muteUser(message.guild, member, `Message flood (${tracker.msgs.length} msgs/${config.spamWindow/1000}s)`);
+      tracker.msgs = [];
+    }
+  }
+});
+
+// ─── ANTI-RAID: Member Join ──────────────────────────────────────────────────
 client.on('guildMemberAdd', async member => {
   if (!isAntiRaidEnabled(member.guild.id)) return;
 
@@ -256,129 +714,172 @@ client.on('guildMemberAdd', async member => {
   if (!joinLog.has(guildId)) joinLog.set(guildId, []);
   const joins = joinLog.get(guildId);
   joins.push(now);
-  // Clean old
   const recent = joins.filter(t => now - t < config.joinRateWindow);
   joinLog.set(guildId, recent);
 
-  // Flag new accounts
   const accountAge = (now - member.user.createdTimestamp) / 86400000;
   const isNewAccount = accountAge < config.newAccountAge;
 
   // Activate raid mode if threshold hit
   if (recent.length >= config.joinRateLimit) {
     raidMode.set(guildId, true);
+    
+    // Auto-lockdown on severe raid
+    if (recent.length >= config.joinRateLimit * 2) {
+      await toggleLockdown(member.guild, true);
+    }
 
     const embed = new EmbedBuilder()
       .setColor(0xff0000)
-      .setAuthor({ name: '⬡  ⚠  raid mode activated' })
-      .setDescription(`\`\`\`diff\n-  ${recent.length} joins detected in ${config.joinRateWindow / 1000}s\n-  all new joins will be kicked\n\`\`\``)
-      .setFooter({ text: 'guardbot  ·  anti-raid' })
+      .setAuthor({ name: '🚨 RAID MODE ACTIVATED' })
+      .setDescription(`\`\`\`diff\n- ${recent.length} JOINS IN ${config.joinRateWindow / 1000}s\n- ALL NEW JOINS WILL BE KICKED\n${recent.length >= config.joinRateLimit * 2 ? '- SERVER LOCKDOWN ENABLED\n' : ''}\`\`\``)
+      .setFooter({ text: 'guardbot · anti-raid' })
       .setTimestamp();
     await sendLog(member.guild, embed);
   }
 
   if (raidMode.get(guildId)) {
+    await sendDMWarning(member.user, member.guild, 'Server is under raid protection. Please try again later.', 'kick');
     await member.kick('[Anti-Raid] Raid mode active').catch(() => {});
 
     const embed = new EmbedBuilder()
       .setColor(0xff6600)
-      .setAuthor({ name: '⬡  anti-raid  ·  member kicked' })
+      .setAuthor({ name: '⬡ RAID KICK' })
       .addFields(
-        { name: 'user',        value: `${member.user.tag} · \`${member.id}\``, inline: true },
-        { name: 'account age', value: `${accountAge.toFixed(1)} days`, inline: true },
-        { name: 'new account', value: isNewAccount ? '```diff\n-  yes  ⚠\n```' : '```diff\n+  no\n```', inline: true },
+        { name: 'User', value: `${member.user.tag} · \`${member.id}\``, inline: true },
+        { name: 'Account Age', value: `${accountAge.toFixed(1)} days`, inline: true },
+        { name: 'New Account', value: isNewAccount ? '```diff\n- YES ⚠\n```' : '```diff\n+ no\n```', inline: true },
       )
-      .setFooter({ text: 'guardbot  ·  anti-raid' })
+      .setFooter({ text: 'guardbot · anti-raid' })
       .setTimestamp();
     await sendLog(member.guild, embed);
     return;
   }
 
-  // Warn about new accounts even outside raid mode
+  // New account handling
   if (isNewAccount) {
-    // Only kick new accounts if newAccountKick is explicitly ON
-    // Default is OFF so TikTok followers (who may have new accounts) can join safely
     if (config.newAccountKick && !isWhitelisted(member.guild, member.id)) {
+      await sendDMWarning(member.user, member.guild, 'Your account is too new. Please try again in a few days.', 'kick');
       await member.kick('[Anti-Raid] New account — too young').catch(() => {});
+      
       const embed = new EmbedBuilder()
         .setColor(0xff6600)
-        .setAuthor({ name: '⬡  anti-raid  ·  new account kicked' })
+        .setAuthor({ name: '⬡ NEW ACCOUNT KICKED' })
         .addFields(
-          { name: 'user',        value: `${member.user.tag} · \`${member.id}\``, inline: true },
-          { name: 'account age', value: `${accountAge.toFixed(1)} days`, inline: true },
-          { name: 'reason',      value: 'account too new (auto-kick enabled)', inline: false },
+          { name: 'User', value: `${member.user.tag} · \`${member.id}\``, inline: true },
+          { name: 'Account Age', value: `${accountAge.toFixed(1)} days`, inline: true },
         )
-        .setFooter({ text: 'guardbot  ·  anti-raid  ·  use /newacckick off to allow new accounts' })
+        .setFooter({ text: 'guardbot · anti-raid' })
         .setTimestamp();
       await sendLog(member.guild, embed);
       return;
     }
 
-    // Just flag/log — don't kick
+    // Just flag - don't kick
     const embed = new EmbedBuilder()
-      .setColor(0xff6600)
-      .setAuthor({ name: '⬡  new account joined  ·  flagged (not kicked)' })
+      .setColor(0xffcc00)
+      .setAuthor({ name: '⚠️ NEW ACCOUNT JOINED' })
       .addFields(
-        { name: 'user',        value: `${member.user.tag} · \`${member.id}\``, inline: true },
-        { name: 'account age', value: `${accountAge.toFixed(1)} days`, inline: true },
-        { name: 'note',        value: 'use `/newacckick on` to auto-kick new accounts', inline: false },
+        { name: 'User', value: `${member.user.tag} · \`${member.id}\``, inline: true },
+        { name: 'Account Age', value: `${accountAge.toFixed(1)} days`, inline: true },
+        { name: 'Status', value: 'Flagged for monitoring', inline: true },
       )
-      .setFooter({ text: 'guardbot  ·  anti-raid' })
+      .setFooter({ text: 'guardbot · anti-raid' })
       .setTimestamp();
     await sendLog(member.guild, embed);
   }
+
+  // Verification gate
+  if (verificationEnabled.get(guildId)) {
+    await quarantineUser(member.guild, member, 'Awaiting verification');
+  }
 });
 
-// ─── ANTI-NUKE: Channel deletes ──────────────────────────────────────────────
+// ─── ANTI-NUKE: Channel Events ───────────────────────────────────────────────
 client.on('channelDelete', async channel => {
   if (!channel.guild) return;
   if (!isAntiNukeEnabled(channel.guild.id)) return;
 
   const entry = await channel.guild.fetchAuditLogs({ type: AuditLogEvent.ChannelDelete, limit: 1 }).catch(() => null);
   const executor = entry?.entries?.first()?.executor;
-  if (!executor) return;
+  if (!executor || executor.id === client.user.id) return;
 
   trackAction(channel.guild.id, 'channelDelete');
   const actions = getActions(channel.guild.id, 'channelDelete');
 
   if (actions.length >= config.maxChannelDeletes) {
-    await punishNuker(channel.guild, executor.id, `Mass channel deletion (${actions.length} channels deleted)`);
+    await punishNuker(channel.guild, executor.id, `Mass channel deletion (${actions.length} channels)`);
   }
 });
 
-// ─── ANTI-NUKE: Role deletes ─────────────────────────────────────────────────
+client.on('channelCreate', async channel => {
+  if (!channel.guild) return;
+  if (!isAntiNukeEnabled(channel.guild.id)) return;
+
+  const entry = await channel.guild.fetchAuditLogs({ type: AuditLogEvent.ChannelCreate, limit: 1 }).catch(() => null);
+  const executor = entry?.entries?.first()?.executor;
+  if (!executor || executor.id === client.user.id) return;
+
+  trackAction(channel.guild.id, 'channelCreate');
+  const actions = getActions(channel.guild.id, 'channelCreate');
+
+  if (actions.length >= config.maxChannelCreates) {
+    await punishNuker(channel.guild, executor.id, `Mass channel creation (${actions.length} channels)`);
+    // Delete the spam channels
+    await channel.delete('[Anti-Nuke] Spam channel').catch(() => {});
+  }
+});
+
+// ─── ANTI-NUKE: Role Events ──────────────────────────────────────────────────
 client.on('roleDelete', async role => {
   if (!isAntiNukeEnabled(role.guild.id)) return;
 
   const entry = await role.guild.fetchAuditLogs({ type: AuditLogEvent.RoleDelete, limit: 1 }).catch(() => null);
   const executor = entry?.entries?.first()?.executor;
-  if (!executor) return;
+  if (!executor || executor.id === client.user.id) return;
 
   trackAction(role.guild.id, 'roleDelete');
   const actions = getActions(role.guild.id, 'roleDelete');
 
   if (actions.length >= config.maxRoleDeletes) {
-    await punishNuker(role.guild, executor.id, `Mass role deletion (${actions.length} roles deleted)`);
+    await punishNuker(role.guild, executor.id, `Mass role deletion (${actions.length} roles)`);
   }
 });
 
-// ─── ANTI-NUKE: Mass bans ────────────────────────────────────────────────────
+client.on('roleCreate', async role => {
+  if (!isAntiNukeEnabled(role.guild.id)) return;
+
+  const entry = await role.guild.fetchAuditLogs({ type: AuditLogEvent.RoleCreate, limit: 1 }).catch(() => null);
+  const executor = entry?.entries?.first()?.executor;
+  if (!executor || executor.id === client.user.id) return;
+
+  trackAction(role.guild.id, 'roleCreate');
+  const actions = getActions(role.guild.id, 'roleCreate');
+
+  if (actions.length >= config.maxRoleCreates) {
+    await punishNuker(role.guild, executor.id, `Mass role creation (${actions.length} roles)`);
+    await role.delete('[Anti-Nuke] Spam role').catch(() => {});
+  }
+});
+
+// ─── ANTI-NUKE: Ban/Kick Events ──────────────────────────────────────────────
 client.on('guildBanAdd', async ban => {
   if (!isAntiNukeEnabled(ban.guild.id)) return;
 
   const entry = await ban.guild.fetchAuditLogs({ type: AuditLogEvent.MemberBanAdd, limit: 1 }).catch(() => null);
   const executor = entry?.entries?.first()?.executor;
-  if (!executor) return;
+  if (!executor || executor.id === client.user.id) return;
 
   trackAction(ban.guild.id, 'ban');
   const actions = getActions(ban.guild.id, 'ban');
 
   if (actions.length >= config.maxBans) {
-    await punishNuker(ban.guild, executor.id, `Mass banning (${actions.length} bans in 1 minute)`);
+    await punishNuker(ban.guild, executor.id, `Mass banning (${actions.length} bans/min)`);
+    // Unban the victim
+    await ban.guild.members.unban(ban.user.id, '[Anti-Nuke] Mass ban victim').catch(() => {});
   }
 });
 
-// ─── ANTI-NUKE: Mass kicks ───────────────────────────────────────────────────
 client.on('guildMemberRemove', async member => {
   if (!isAntiNukeEnabled(member.guild.id)) return;
 
@@ -386,29 +887,77 @@ client.on('guildMemberRemove', async member => {
   const log = entry?.entries?.first();
   if (!log || log.target?.id !== member.id) return;
   const executor = log.executor;
-  if (!executor) return;
+  if (!executor || executor.id === client.user.id) return;
 
   trackAction(member.guild.id, 'kick');
   const actions = getActions(member.guild.id, 'kick');
 
   if (actions.length >= config.maxKicks) {
-    await punishNuker(member.guild, executor.id, `Mass kicking (${actions.length} kicks in 1 minute)`);
+    await punishNuker(member.guild, executor.id, `Mass kicking (${actions.length} kicks/min)`);
   }
 });
 
-// ─── ANTI-NUKE: Webhook spam ─────────────────────────────────────────────────
+// ─── ANTI-NUKE: Webhook Events ───────────────────────────────────────────────
 client.on('webhooksUpdate', async channel => {
   if (!isAntiNukeEnabled(channel.guild.id)) return;
 
   const entry = await channel.guild.fetchAuditLogs({ type: AuditLogEvent.WebhookCreate, limit: 1 }).catch(() => null);
   const executor = entry?.entries?.first()?.executor;
-  if (!executor) return;
+  if (!executor || executor.id === client.user.id) return;
 
   trackAction(channel.guild.id, 'webhook');
   const actions = getActions(channel.guild.id, 'webhook');
 
   if (actions.length >= config.maxWebhookCreates) {
     await punishNuker(channel.guild, executor.id, `Mass webhook creation (${actions.length} webhooks)`);
+    
+    // Delete malicious webhooks
+    const webhooks = await channel.fetchWebhooks().catch(() => null);
+    if (webhooks) {
+      for (const wh of webhooks.values()) {
+        if (wh.owner?.id === executor.id) {
+          await wh.delete('[Anti-Nuke] Malicious webhook').catch(() => {});
+        }
+      }
+    }
+  }
+});
+
+// ─── ANTI-NUKE: Permission Changes ───────────────────────────────────────────
+client.on('guildMemberUpdate', async (oldMember, newMember) => {
+  if (!isAntiNukeEnabled(newMember.guild.id)) return;
+
+  // Check if admin role was given
+  const hadAdmin = oldMember.permissions.has(PermissionFlagsBits.Administrator);
+  const hasAdmin = newMember.permissions.has(PermissionFlagsBits.Administrator);
+
+  if (!hadAdmin && hasAdmin) {
+    const entry = await newMember.guild.fetchAuditLogs({ type: AuditLogEvent.MemberRoleUpdate, limit: 1 }).catch(() => null);
+    const executor = entry?.entries?.first()?.executor;
+    if (!executor || executor.id === client.user.id || executor.id === newMember.guild.ownerId) return;
+
+    trackAction(newMember.guild.id, 'permissionChange');
+    const actions = getActions(newMember.guild.id, 'permissionChange');
+
+    const embed = new EmbedBuilder()
+      .setColor(0xff0000)
+      .setAuthor({ name: '⚠️ ADMIN PERMISSION GRANTED' })
+      .addFields(
+        { name: 'Target', value: `<@${newMember.id}>`, inline: true },
+        { name: 'By', value: `<@${executor.id}>`, inline: true },
+      )
+      .setFooter({ text: 'guardbot · permission monitor' })
+      .setTimestamp();
+    await sendLog(newMember.guild, embed);
+
+    if (actions.length >= config.maxPermissionChanges) {
+      await punishNuker(newMember.guild, executor.id, `Mass permission changes (${actions.length} admin grants)`);
+      // Remove the admin from the target
+      const adminRole = newMember.roles.cache.find(r => r.permissions.has(PermissionFlagsBits.Administrator));
+      if (adminRole) {
+        await newMember.roles.remove(adminRole, '[Anti-Nuke] Unauthorized admin grant').catch(() => {});
+      }
+    }
   }
 });
 
@@ -416,136 +965,169 @@ client.on('webhooksUpdate', async channel => {
 const commands = [
   {
     name: 'help',
-    description: '📋 Show all bot commands and info',
+    description: '📋 Show all bot commands and features',
   },
   {
-    name: 'newacckick',
-    description: '🔞 Toggle auto-kick for new accounts (default: OFF — safe for TikTok followers)',
-    options: [{
-      name: 'toggle',
-      description: 'Enable or disable',
-      type: 3, required: true,
-      choices: [{ name: 'Enable', value: 'on' }, { name: 'Disable', value: 'off' }]
-    }]
+    name: 'status',
+    description: '📊 Show current protection status and threat levels',
   },
   {
-    name: 'antispam',
-    description: '🚫 Toggle Anti-Spam protection (invite links & message spam)',
-    options: [{
-      name: 'toggle',
-      description: 'Enable or disable',
-      type: 3, required: true,
-      choices: [{ name: 'Enable', value: 'on' }, { name: 'Disable', value: 'off' }]
-    }]
+    name: 'bio',
+    description: '🤖 About GuardBot',
   },
+  // Toggle commands
   {
     name: 'antinuke',
     description: '🔒 Toggle Anti-Nuke protection',
-    options: [{
-      name: 'toggle',
-      description: 'Enable or disable',
-      type: 3, required: true,
-      choices: [{ name: 'Enable', value: 'on' }, { name: 'Disable', value: 'off' }]
-    }]
+    options: [{ name: 'toggle', description: 'Enable or disable', type: 3, required: true, choices: [{ name: 'Enable', value: 'on' }, { name: 'Disable', value: 'off' }] }]
   },
   {
     name: 'antiraid',
     description: '🛡️ Toggle Anti-Raid protection',
-    options: [{
-      name: 'toggle',
-      description: 'Enable or disable',
-      type: 3, required: true,
-      choices: [{ name: 'Enable', value: 'on' }, { name: 'Disable', value: 'off' }]
-    }]
+    options: [{ name: 'toggle', description: 'Enable or disable', type: 3, required: true, choices: [{ name: 'Enable', value: 'on' }, { name: 'Disable', value: 'off' }] }]
+  },
+  {
+    name: 'antispam',
+    description: '🚫 Toggle Anti-Spam protection',
+    options: [{ name: 'toggle', description: 'Enable or disable', type: 3, required: true, choices: [{ name: 'Enable', value: 'on' }, { name: 'Disable', value: 'off' }] }]
+  },
+  {
+    name: 'antilink',
+    description: '🔗 Toggle suspicious link protection',
+    options: [{ name: 'toggle', description: 'Enable or disable', type: 3, required: true, choices: [{ name: 'Enable', value: 'on' }, { name: 'Disable', value: 'off' }] }]
+  },
+  {
+    name: 'antimention',
+    description: '📢 Toggle mass mention protection',
+    options: [{ name: 'toggle', description: 'Enable or disable', type: 3, required: true, choices: [{ name: 'Enable', value: 'on' }, { name: 'Disable', value: 'off' }] }]
+  },
+  {
+    name: 'dmwarnings',
+    description: '📩 Toggle DM warnings to users',
+    options: [{ name: 'toggle', description: 'Enable or disable', type: 3, required: true, choices: [{ name: 'Enable', value: 'on' }, { name: 'Disable', value: 'off' }] }]
+  },
+  {
+    name: 'newacckick',
+    description: '🔞 Toggle auto-kick for new accounts',
+    options: [{ name: 'toggle', description: 'Enable or disable', type: 3, required: true, choices: [{ name: 'Enable', value: 'on' }, { name: 'Disable', value: 'off' }] }]
   },
   {
     name: 'raidmode',
-    description: '🚨 Manually toggle raid mode (kicks all new joins)',
-    options: [{
-      name: 'toggle',
-      description: 'Enable or disable',
-      type: 3, required: true,
-      choices: [{ name: 'Enable', value: 'on' }, { name: 'Disable', value: 'off' }]
-    }]
+    description: '🚨 Manually toggle raid mode',
+    options: [{ name: 'toggle', description: 'Enable or disable', type: 3, required: true, choices: [{ name: 'Enable', value: 'on' }, { name: 'Disable', value: 'off' }] }]
+  },
+  // Emergency commands
+  {
+    name: 'lockdown',
+    description: '🔐 Emergency server lockdown - prevents all messages',
+    options: [{ name: 'toggle', description: 'Enable or disable', type: 3, required: true, choices: [{ name: 'Enable', value: 'on' }, { name: 'Disable', value: 'off' }] }]
   },
   {
+    name: 'panic',
+    description: '🚨 PANIC BUTTON - Instant lockdown + raid mode + kick recent joins',
+  },
+  // User management
+  {
     name: 'whitelist',
-    description: '✅ Whitelist a user from anti-nuke actions',
-    options: [{
-      name: 'user',
-      description: 'User to whitelist',
-      type: 6, required: true
-    }]
+    description: '✅ Whitelist a user from all detection',
+    options: [{ name: 'user', description: 'User to whitelist', type: 6, required: true }]
   },
   {
     name: 'unwhitelist',
-    description: '❌ Remove a user from the whitelist',
-    options: [{
-      name: 'user',
-      description: 'User to remove',
-      type: 6, required: true
-    }]
+    description: '❌ Remove user from whitelist',
+    options: [{ name: 'user', description: 'User to remove', type: 6, required: true }]
   },
   {
-    name: 'status',
-    description: '📊 Show current protection status',
+    name: 'quarantine',
+    description: '🔒 Quarantine a suspicious user',
+    options: [{ name: 'user', description: 'User to quarantine', type: 6, required: true }, { name: 'reason', description: 'Reason', type: 3, required: false }]
   },
   {
-    name: 'bio',
-    description: '🤖 About this bot',
+    name: 'unquarantine',
+    description: '🔓 Release a user from quarantine',
+    options: [{ name: 'user', description: 'User to release', type: 6, required: true }]
+  },
+  {
+    name: 'threat',
+    description: '📊 Check threat level of a user',
+    options: [{ name: 'user', description: 'User to check', type: 6, required: true }]
+  },
+  {
+    name: 'clearthreat',
+    description: '🧹 Clear threat level of a user',
+    options: [{ name: 'user', description: 'User to clear', type: 6, required: true }]
+  },
+  // Moderation
+  {
+    name: 'nuke',
+    description: '💣 Mass delete messages in channel',
+    options: [{ name: 'amount', description: 'Number of messages (1-100)', type: 4, required: true }]
+  },
+  {
+    name: 'slowmode',
+    description: '🐌 Set channel slowmode',
+    options: [{ name: 'seconds', description: 'Slowmode duration (0 to disable)', type: 4, required: true }]
   },
 ];
 
-// ─── AUTO-CREATE PRIVATE #mod-logs ───────────────────────────────────────────
+// ─── AUTO-CREATE MOD-LOGS ────────────────────────────────────────────────────
 async function ensureModLogsChannel(guild) {
   let ch = guild.channels.cache.find(c => c.name === config.logChannelName && c.isTextBased());
   if (ch) {
-    // Make sure it's private (deny @everyone view)
     await ch.permissionOverwrites.edit(guild.roles.everyone, { ViewChannel: false }).catch(() => {});
     return ch;
   }
 
-  // Create it if it doesn't exist
   ch = await guild.channels.create({
     name: config.logChannelName,
-    type: 0, // GUILD_TEXT
+    type: 0,
     permissionOverwrites: [
-      {
-        id: guild.roles.everyone.id,
-        deny: ['ViewChannel'],
-      },
-      {
-        id: guild.members.me.id,
-        allow: ['ViewChannel', 'SendMessages', 'EmbedLinks'],
-      },
+      { id: guild.roles.everyone.id, deny: ['ViewChannel'] },
+      { id: guild.members.me.id, allow: ['ViewChannel', 'SendMessages', 'EmbedLinks'] },
     ],
-    topic: '⬡ private security logs  ·  guardbot',
-    reason: 'GuardBot: auto-created private mod-logs channel',
+    topic: '⬡ GUARDBOT SECURITY LOGS · ALL THREATS LOGGED HERE',
+    reason: 'GuardBot: Auto-created private mod-logs',
   }).catch(() => null);
 
   return ch;
 }
 
-// ─── READY ───────────────────────────────────────────────────────────────────
+// ─── READY EVENT ─────────────────────────────────────────────────────────────
 client.once('ready', async () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
+  console.log(`
+╔═══════════════════════════════════════════════════════════════╗
+║                                                               ║
+║   ██████╗ ██╗   ██╗ █████╗ ██████╗ ██████╗ ██████╗  ██████╗ ████████╗  ║
+║  ██╔════╝ ██║   ██║██╔══██╗██╔══██╗██╔══██╗██╔══██╗██╔═══██╗╚══██╔══╝  ║
+║  ██║  ███╗██║   ██║███████║██████╔╝██║  ██║██████╔╝██║   ██║   ██║     ║
+║  ██║   ██║██║   ██║██╔══██║██╔══██╗██║  ██║██╔══██╗██║   ██║   ██║     ║
+║  ╚██████╔╝╚██████╔╝██║  ██║██║  ██║██████╔╝██████╔╝╚██████╔╝   ██║     ║
+║   ╚═════╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚═════╝  ╚═════╝    ╚═╝     ║
+║                                                               ║
+║   ✅ Bot Online: ${client.user.tag.padEnd(43)}║
+║   🛡️  Servers Protected: ${String(client.guilds.cache.size).padEnd(37)}║
+║   ⚡ All Systems: ACTIVE                                       ║
+║                                                               ║
+╚═══════════════════════════════════════════════════════════════╝
+`);
 
-  // Ensure private mod-logs exists in every guild
+  // Ensure mod-logs in all guilds
   for (const guild of client.guilds.cache.values()) {
     await ensureModLogsChannel(guild);
+    await ensureQuarantineRole(guild);
   }
 
-  // Set bio / presence rotation
+  // Status rotation
   let i = 0;
   const rotate = () => {
     const s = config.statuses[i % config.statuses.length];
-    client.user.setPresence({ activities: [{ name: s.name, type: s.type }], status: 'online' });
+    client.user.setPresence({ activities: [{ name: s.name, type: s.type }], status: 'dnd' }); // DND = Do Not Disturb (red)
     i++;
   };
   rotate();
-  setInterval(rotate, 30000);
+  setInterval(rotate, 15000); // Faster rotation
 
-  // Register slash commands globally
+  // Register slash commands
   const rest = new REST({ version: '10' }).setToken(config.token);
   try {
     await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
@@ -566,16 +1148,18 @@ client.on('interactionCreate', async interaction => {
   if (commandName === 'help') {
     const embed = new EmbedBuilder()
       .setColor(0x1a1a2e)
-      .setAuthor({ name: '✦ guardbot  ·  command list', iconURL: client.user.displayAvatarURL() })
-      .setDescription('```\n  24/7 server protection against raids,\n  nukes, and spam.\n```')
+      .setAuthor({ name: '⬡ GUARDBOT · COMMAND LIST', iconURL: client.user.displayAvatarURL() })
+      .setDescription('```ansi\n\u001b[1;31m24/7 MAXIMUM SECURITY PROTECTION\n\u001b[0;37mZero tolerance for raids, nukes & spam\n```')
       .addFields(
-        { name: '⬡  anti-nuke', value: '`/antinuke on|off`\n`/whitelist @user`\n`/unwhitelist @user`', inline: true },
-        { name: '⬡  anti-raid', value: '`/antiraid on|off`\n`/raidmode on|off`\n`/newacckick on|off` — auto-kick new accounts', inline: true },
-        { name: '⬡  anti-spam', value: '`/antispam on|off`', inline: true },
-        { name: '⬡  info', value: '`/status`  ·  `/bio`  ·  `/help`', inline: false },
-        { name: '⬡  thresholds', value: `raid  ·  **${config.joinRateLimit} joins** / ${config.joinRateWindow / 1000}s\nnuke  ·  **${config.maxBans} bans**  ·  **${config.maxChannelDeletes} ch-dels**  ·  **${config.maxRoleDeletes} role-dels** / min\nspam  ·  **${config.maxInviteSpam} invite links** / ${config.spamWindow / 1000}s`, inline: false },
+        { name: '🔒 ANTI-NUKE', value: '`/antinuke` · `/whitelist` · `/unwhitelist`', inline: true },
+        { name: '🛡️ ANTI-RAID', value: '`/antiraid` · `/raidmode` · `/newacckick`', inline: true },
+        { name: '🚫 ANTI-SPAM', value: '`/antispam` · `/antilink` · `/antimention`', inline: true },
+        { name: '🚨 EMERGENCY', value: '`/lockdown` · `/panic` · `/nuke`', inline: true },
+        { name: '👤 USER MGMT', value: '`/quarantine` · `/threat` · `/clearthreat`', inline: true },
+        { name: '📊 INFO', value: '`/status` · `/bio` · `/slowmode`', inline: true },
+        { name: '⚡ THRESHOLDS', value: `\`\`\`diff\n- Raid: ${config.joinRateLimit} joins/${config.joinRateWindow/1000}s\n- Nuke: ${config.maxBans} bans · ${config.maxChannelDeletes} ch-dels/min\n- Spam: ${config.maxInviteSpam} invite · ${config.maxMentionsPerMessage} mentions\n\`\`\``, inline: false },
       )
-      .setFooter({ text: 'admin permission required for all toggle commands' })
+      .setFooter({ text: '⚠️ Admin permission required for all commands' })
       .setTimestamp();
     return interaction.reply({ embeds: [embed] });
   }
@@ -584,18 +1168,18 @@ client.on('interactionCreate', async interaction => {
   if (commandName === 'bio') {
     const embed = new EmbedBuilder()
       .setColor(0x1a1a2e)
-      .setAuthor({ name: '✦ guardbot  ·  about', iconURL: client.user.displayAvatarURL() })
+      .setAuthor({ name: '⬡ GUARDBOT · ABOUT', iconURL: client.user.displayAvatarURL() })
       .setThumbnail(client.user.displayAvatarURL())
-      .setDescription('```\n  24/7 security bot — protecting discord\n  servers from raids, nukes & spam.\n```')
+      .setDescription('```ansi\n\u001b[1;31mMAXIMUM SECURITY DISCORD BOT\n\u001b[0;37mZero Tolerance · Instant Response\n```')
       .addFields(
-        { name: '⬡  anti-raid', value: 'detects mass join floods & new accounts.\nauto-kicks during active raids.', inline: true },
-        { name: '⬡  anti-nuke', value: 'monitors mass bans, kicks, deletions\n& webhook abuse. bans attackers instantly.', inline: true },
-        { name: '⬡  anti-spam', value: 'deletes invite links & times out\nspammers automatically.', inline: true },
-        { name: '⬡  whitelist', value: 'trusted admins bypass all detection.', inline: true },
-        { name: '⬡  24/7 online', value: 'runs continuously with rotating status.', inline: true },
-        { name: '⬡  version', value: '1.0.0  ·  discord.js v14', inline: true },
+        { name: '🔒 ANTI-NUKE', value: 'Mass ban/kick/delete detection\nPermission abuse monitoring\nAdmin compromise protection', inline: true },
+        { name: '🛡️ ANTI-RAID', value: 'Join flood detection\nNew account filtering\nAuto-lockdown on severe raids', inline: true },
+        { name: '🚫 ANTI-SPAM', value: 'Invite link blocking\nPhishing link detection\nMass mention protection\nEmoji/caps spam filter', inline: true },
+        { name: '⚡ FEATURES', value: 'Threat level system\nDM warning system\nQuarantine system\nPanic button\nAuto-slowmode', inline: true },
+        { name: '📊 VERSION', value: '2.0.0 ENHANCED\ndiscord.js v14', inline: true },
+        { name: '🔥 MODE', value: 'ZERO TOLERANCE\nINSTANT RESPONSE', inline: true },
       )
-      .setFooter({ text: 'guardbot  ·  always watching' })
+      .setFooter({ text: 'guardbot · always watching · always protecting' })
       .setTimestamp();
     return interaction.reply({ embeds: [embed] });
   }
@@ -604,84 +1188,125 @@ client.on('interactionCreate', async interaction => {
   if (commandName === 'status') {
     const raidEnabled = isAntiRaidEnabled(guild.id);
     const nukeEnabled = isAntiNukeEnabled(guild.id);
-    const spamEnabled = antiSpamEnabled.get(guild.id) !== false;
+    const spamEnabled = isAntiSpamEnabled(guild.id);
+    const linkEnabled = isAntiLinkEnabled(guild.id);
+    const mentionEnabled = isAntiMentionEnabled(guild.id);
     const inRaid = raidMode.get(guild.id) || false;
+    const inLockdown = lockdownMode.get(guild.id) || false;
     const wl = whitelist.get(guild.id) || new Set();
 
     const embed = new EmbedBuilder()
-      .setColor(inRaid ? 0xff0000 : 0x1a1a2e)
-      .setAuthor({ name: `✦ guardbot  ·  protection status${inRaid ? '  ·  ⚠ raid mode active' : ''}`, iconURL: client.user.displayAvatarURL() })
-      .setDescription(inRaid ? '```\n  ⚠  raid mode is currently active!\n  new joins are being kicked.\n```' : '```\n  all systems operational.\n```')
+      .setColor(inLockdown ? 0xff0000 : inRaid ? 0xff6600 : 0x00ff00)
+      .setAuthor({ name: `⬡ GUARDBOT · STATUS${inLockdown ? ' · 🔐 LOCKDOWN' : inRaid ? ' · 🚨 RAID MODE' : ''}`, iconURL: client.user.displayAvatarURL() })
+      .setDescription(inLockdown ? '```diff\n- SERVER IS IN LOCKDOWN\n- ALL MESSAGES BLOCKED\n```' : inRaid ? '```diff\n- RAID MODE ACTIVE\n- NEW JOINS BEING KICKED\n```' : '```diff\n+ ALL SYSTEMS OPERATIONAL\n```')
       .addFields(
-        { name: '⬡  anti-raid',  value: raidEnabled  ? '```diff\n+ enabled\n```' : '```diff\n- disabled\n```', inline: true },
-        { name: '⬡  anti-nuke',  value: nukeEnabled  ? '```diff\n+ enabled\n```' : '```diff\n- disabled\n```', inline: true },
-        { name: '⬡  anti-spam',  value: spamEnabled  ? '```diff\n+ enabled\n```' : '```diff\n- disabled\n```', inline: true },
-        { name: '⬡  raid mode',  value: inRaid ? '```diff\n- active\n```' : '```diff\n+ inactive\n```', inline: true },
-        { name: '⬡  new acc kick', value: config.newAccountKick ? '```diff\n- on (kicking new accs)\n```' : '```diff\n+ off (followers can join)\n```', inline: true },
-        { name: '⬡  whitelist',  value: wl.size > 0 ? [...wl].map(id => `<@${id}>`).join(' · ') : 'none', inline: false },
+        { name: '🔒 Anti-Nuke', value: nukeEnabled ? '```diff\n+ ON\n```' : '```diff\n- OFF\n```', inline: true },
+        { name: '🛡️ Anti-Raid', value: raidEnabled ? '```diff\n+ ON\n```' : '```diff\n- OFF\n```', inline: true },
+        { name: '🚫 Anti-Spam', value: spamEnabled ? '```diff\n+ ON\n```' : '```diff\n- OFF\n```', inline: true },
+        { name: '🔗 Anti-Link', value: linkEnabled ? '```diff\n+ ON\n```' : '```diff\n- OFF\n```', inline: true },
+        { name: '📢 Anti-Mention', value: mentionEnabled ? '```diff\n+ ON\n```' : '```diff\n- OFF\n```', inline: true },
+        { name: '👶 New Acc Kick', value: config.newAccountKick ? '```diff\n- ON\n```' : '```diff\n+ OFF\n```', inline: true },
+        { name: '✅ Whitelist', value: wl.size > 0 ? [...wl].map(id => `<@${id}>`).join(' ') : 'None', inline: false },
       )
-      .setFooter({ text: `guardbot  ·  ${guild.name}` })
+      .setFooter({ text: `guardbot · ${guild.name}` })
       .setTimestamp();
     return interaction.reply({ embeds: [embed] });
   }
 
-  // Admin-only commands below
+  // Admin-only commands
   if (!isAdmin) {
-    return interaction.reply({ content: '❌ You need **Administrator** permission to use this command.', ephemeral: true });
+    return interaction.reply({ content: '❌ **ADMINISTRATOR** permission required.', ephemeral: true });
   }
 
-  // /newacckick
-  if (commandName === 'newacckick') {
-    const val = interaction.options.getString('toggle') === 'on';
-    config.newAccountKick = val;
-    return interaction.reply({ embeds: [new EmbedBuilder()
-      .setColor(0x1a1a2e)
-      .setDescription(val
-        ? '```diff\n-  new account auto-kick ENABLED\n-  accounts under 3 days old will be kicked\n```'
-        : '```diff\n+  new account auto-kick DISABLED\n+  new accounts (like TikTok followers) can join safely\n```')
-      .setFooter({ text: 'guardbot  ·  new account kick' }).setTimestamp()] });
-  }
-
-  // /antispam
-  if (commandName === 'antispam') {
-    const val = interaction.options.getString('toggle') === 'on';
-    antiSpamEnabled.set(guild.id, val);
-    return interaction.reply({ embeds: [new EmbedBuilder()
-      .setColor(0x1a1a2e)
-      .setDescription(`\`\`\`diff\n${val ? '+' : '-'}  anti-spam is now ${val ? 'enabled' : 'disabled'}\n\`\`\``)
-      .setFooter({ text: 'guardbot  ·  anti-spam' }).setTimestamp()] });
-  }
-
-  // /antinuke
+  // Toggle commands
   if (commandName === 'antinuke') {
     const val = interaction.options.getString('toggle') === 'on';
     antiNukeEnabled.set(guild.id, val);
-    return interaction.reply({ embeds: [new EmbedBuilder()
-      .setColor(0x1a1a2e)
-      .setDescription(`\`\`\`diff\n${val ? '+' : '-'}  anti-nuke is now ${val ? 'enabled' : 'disabled'}\n\`\`\``)
-      .setFooter({ text: 'guardbot  ·  anti-nuke' }).setTimestamp()] });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x1a1a2e).setDescription(`\`\`\`diff\n${val ? '+' : '-'} Anti-Nuke is now ${val ? 'ENABLED' : 'DISABLED'}\n\`\`\``).setTimestamp()] });
   }
 
-  // /antiraid
   if (commandName === 'antiraid') {
     const val = interaction.options.getString('toggle') === 'on';
     antiRaidEnabled.set(guild.id, val);
-    return interaction.reply({ embeds: [new EmbedBuilder()
-      .setColor(0x1a1a2e)
-      .setDescription(`\`\`\`diff\n${val ? '+' : '-'}  anti-raid is now ${val ? 'enabled' : 'disabled'}\n\`\`\``)
-      .setFooter({ text: 'guardbot  ·  anti-raid' }).setTimestamp()] });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x1a1a2e).setDescription(`\`\`\`diff\n${val ? '+' : '-'} Anti-Raid is now ${val ? 'ENABLED' : 'DISABLED'}\n\`\`\``).setTimestamp()] });
   }
 
-  // /raidmode
+  if (commandName === 'antispam') {
+    const val = interaction.options.getString('toggle') === 'on';
+    antiSpamEnabled.set(guild.id, val);
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x1a1a2e).setDescription(`\`\`\`diff\n${val ? '+' : '-'} Anti-Spam is now ${val ? 'ENABLED' : 'DISABLED'}\n\`\`\``).setTimestamp()] });
+  }
+
+  if (commandName === 'antilink') {
+    const val = interaction.options.getString('toggle') === 'on';
+    antiLinkEnabled.set(guild.id, val);
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x1a1a2e).setDescription(`\`\`\`diff\n${val ? '+' : '-'} Anti-Link is now ${val ? 'ENABLED' : 'DISABLED'}\n\`\`\``).setTimestamp()] });
+  }
+
+  if (commandName === 'antimention') {
+    const val = interaction.options.getString('toggle') === 'on';
+    antiMentionEnabled.set(guild.id, val);
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x1a1a2e).setDescription(`\`\`\`diff\n${val ? '+' : '-'} Anti-Mention is now ${val ? 'ENABLED' : 'DISABLED'}\n\`\`\``).setTimestamp()] });
+  }
+
+  if (commandName === 'dmwarnings') {
+    const val = interaction.options.getString('toggle') === 'on';
+    dmWarningsEnabled.set(guild.id, val);
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x1a1a2e).setDescription(`\`\`\`diff\n${val ? '+' : '-'} DM Warnings is now ${val ? 'ENABLED' : 'DISABLED'}\n\`\`\``).setTimestamp()] });
+  }
+
+  if (commandName === 'newacckick') {
+    const val = interaction.options.getString('toggle') === 'on';
+    config.newAccountKick = val;
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x1a1a2e).setDescription(val ? '```diff\n- New account auto-kick ENABLED\n- Accounts under 7 days will be kicked\n```' : '```diff\n+ New account auto-kick DISABLED\n+ New accounts can join safely\n```').setTimestamp()] });
+  }
+
   if (commandName === 'raidmode') {
     const val = interaction.options.getString('toggle') === 'on';
     raidMode.set(guild.id, val);
-    return interaction.reply({ embeds: [new EmbedBuilder()
-      .setColor(val ? 0xff0000 : 0x1a1a2e)
-      .setDescription(val
-        ? '```diff\n-  ⚠  raid mode activated\n-  all new joins will be kicked\n```'
-        : '```diff\n+  raid mode deactivated\n+  server is back to normal\n```')
-      .setFooter({ text: 'guardbot  ·  raid mode' }).setTimestamp()] });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(val ? 0xff0000 : 0x00ff00).setDescription(val ? '```diff\n- ⚠ RAID MODE ACTIVATED\n- All new joins will be kicked\n```' : '```diff\n+ Raid mode deactivated\n+ Server back to normal\n```').setTimestamp()] });
+  }
+
+  // /lockdown
+  if (commandName === 'lockdown') {
+    const val = interaction.options.getString('toggle') === 'on';
+    await toggleLockdown(guild, val);
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(val ? 0xff0000 : 0x00ff00).setDescription(val ? '```diff\n- 🔐 SERVER LOCKDOWN ACTIVATED\n- All channels locked\n- No messages allowed\n```' : '```diff\n+ Lockdown lifted\n+ Server restored\n```').setTimestamp()] });
+  }
+
+  // /panic - EMERGENCY
+  if (commandName === 'panic') {
+    await interaction.deferReply();
+    
+    // 1. Enable lockdown
+    await toggleLockdown(guild, true);
+    
+    // 2. Enable raid mode
+    raidMode.set(guild.id, true);
+    
+    // 3. Kick all members who joined in last 10 minutes
+    const tenMinAgo = Date.now() - 600000;
+    let kicked = 0;
+    
+    for (const member of guild.members.cache.values()) {
+      if (member.joinedTimestamp > tenMinAgo && !member.permissions.has(PermissionFlagsBits.Administrator)) {
+        await member.kick('[PANIC] Emergency protocol').catch(() => {});
+        kicked++;
+      }
+    }
+
+    const embed = new EmbedBuilder()
+      .setColor(0xff0000)
+      .setAuthor({ name: '🚨 PANIC BUTTON ACTIVATED' })
+      .setDescription('```diff\n- EMERGENCY PROTOCOL ENGAGED\n```')
+      .addFields(
+        { name: 'Lockdown', value: '```diff\n- ACTIVE\n```', inline: true },
+        { name: 'Raid Mode', value: '```diff\n- ACTIVE\n```', inline: true },
+        { name: 'Recent Kicks', value: `\`\`\`diff\n- ${kicked} members\n\`\`\``, inline: true },
+      )
+      .setFooter({ text: 'Use /lockdown off and /raidmode off to restore' })
+      .setTimestamp();
+    return interaction.editReply({ embeds: [embed] });
   }
 
   // /whitelist
@@ -689,22 +1314,98 @@ client.on('interactionCreate', async interaction => {
     const user = interaction.options.getUser('user');
     if (!whitelist.has(guild.id)) whitelist.set(guild.id, new Set());
     whitelist.get(guild.id).add(user.id);
-    return interaction.reply({ embeds: [new EmbedBuilder()
-      .setColor(0x1a1a2e)
-      .setDescription(`\`\`\`diff\n+  ${user.tag} added to whitelist\n+  exempt from all anti-nuke detection\n\`\`\``)
-      .setFooter({ text: 'guardbot  ·  whitelist' }).setTimestamp()] });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x00ff00).setDescription(`\`\`\`diff\n+ ${user.tag} added to whitelist\n+ Exempt from all detection\n\`\`\``).setTimestamp()] });
   }
 
   // /unwhitelist
   if (commandName === 'unwhitelist') {
     const user = interaction.options.getUser('user');
     whitelist.get(guild.id)?.delete(user.id);
-    return interaction.reply({ embeds: [new EmbedBuilder()
-      .setColor(0x1a1a2e)
-      .setDescription(`\`\`\`diff\n-  ${user.tag} removed from whitelist\n\`\`\``)
-      .setFooter({ text: 'guardbot  ·  whitelist' }).setTimestamp()] });
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xff6600).setDescription(`\`\`\`diff\n- ${user.tag} removed from whitelist\n\`\`\``).setTimestamp()] });
+  }
+
+  // /quarantine
+  if (commandName === 'quarantine') {
+    const user = interaction.options.getUser('user');
+    const reason = interaction.options.getString('reason') || 'Manual quarantine';
+    const targetMember = await guild.members.fetch(user.id).catch(() => null);
+    
+    if (!targetMember) return interaction.reply({ content: '❌ User not found.', ephemeral: true });
+    
+    const success = await quarantineUser(guild, targetMember, reason);
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(success ? 0x808080 : 0xff0000).setDescription(success ? `\`\`\`diff\n- ${user.tag} has been quarantined\n- Reason: ${reason}\n\`\`\`` : '```diff\n- Failed to quarantine user\n```').setTimestamp()] });
+  }
+
+  // /unquarantine
+  if (commandName === 'unquarantine') {
+    const user = interaction.options.getUser('user');
+    const targetMember = await guild.members.fetch(user.id).catch(() => null);
+    
+    if (!targetMember) return interaction.reply({ content: '❌ User not found.', ephemeral: true });
+    
+    const role = guild.roles.cache.find(r => r.name === config.quarantineRoleName);
+    if (role) await targetMember.roles.remove(role).catch(() => {});
+    quarantinedUsers.delete(user.id);
+    
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x00ff00).setDescription(`\`\`\`diff\n+ ${user.tag} released from quarantine\n\`\`\``).setTimestamp()] });
+  }
+
+  // /threat
+  if (commandName === 'threat') {
+    const user = interaction.options.getUser('user');
+    const threat = getThreatLevel(user.id);
+    const score = getThreatScore(user.id);
+    
+    const embed = new EmbedBuilder()
+      .setColor(score > 10 ? 0xff0000 : score > 5 ? 0xff6600 : 0x00ff00)
+      .setAuthor({ name: `📊 Threat Level: ${user.tag}` })
+      .addFields(
+        { name: 'Score', value: `\`${score}\``, inline: true },
+        { name: 'Warnings', value: `\`${threat.warnings}\``, inline: true },
+        { name: 'Mutes', value: `\`${threat.mutes}\``, inline: true },
+        { name: 'Kicks', value: `\`${threat.kicks}\``, inline: true },
+        { name: 'Risk Level', value: score > 10 ? '```diff\n- HIGH RISK\n```' : score > 5 ? '```fix\nMEDIUM RISK\n```' : '```diff\n+ LOW RISK\n```', inline: false },
+      )
+      .setTimestamp();
+    return interaction.reply({ embeds: [embed] });
+  }
+
+  // /clearthreat
+  if (commandName === 'clearthreat') {
+    const user = interaction.options.getUser('user');
+    threatLevel.delete(user.id);
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x00ff00).setDescription(`\`\`\`diff\n+ Threat level cleared for ${user.tag}\n\`\`\``).setTimestamp()] });
+  }
+
+  // /nuke (purge messages)
+  if (commandName === 'nuke') {
+    const amount = interaction.options.getInteger('amount');
+    if (amount < 1 || amount > 100) return interaction.reply({ content: '❌ Amount must be 1-100', ephemeral: true });
+    
+    await interaction.deferReply({ ephemeral: true });
+    const deleted = await interaction.channel.bulkDelete(amount, true).catch(() => null);
+    
+    const embed = new EmbedBuilder()
+      .setColor(0xff6600)
+      .setAuthor({ name: '💣 MESSAGES NUKED' })
+      .addFields(
+        { name: 'Channel', value: `<#${interaction.channel.id}>`, inline: true },
+        { name: 'Deleted', value: `${deleted?.size || 0} messages`, inline: true },
+        { name: 'By', value: `<@${interaction.user.id}>`, inline: true },
+      )
+      .setTimestamp();
+    await sendLog(guild, embed);
+    
+    return interaction.editReply({ content: `✅ Deleted ${deleted?.size || 0} messages.` });
+  }
+
+  // /slowmode
+  if (commandName === 'slowmode') {
+    const seconds = interaction.options.getInteger('seconds');
+    await interaction.channel.setRateLimitPerUser(seconds).catch(() => {});
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x1a1a2e).setDescription(`\`\`\`diff\n${seconds > 0 ? '-' : '+'} Slowmode set to ${seconds}s\n\`\`\``).setTimestamp()] });
   }
 });
 
-// ─── START ───────────────────────────────────────────────────────────────────
+// ─── START BOT ───────────────────────────────────────────────────────────────
 client.login(config.token);
