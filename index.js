@@ -349,6 +349,65 @@ async function punishNuker(guild, odding, reason) {
   }
 }
 
+// ─── INSTANT BAN BOT (ZERO TOLERANCE) ────────────────────────────────────────
+async function instantBanBot(guild, botId, reason) {
+  if (isWhitelisted(guild, botId)) return;
+  
+  try {
+    const botMember = await guild.members.fetch(botId).catch(() => null);
+    
+    // Even if we can't fetch the member, try to ban by ID
+    await guild.members.ban(botId, { 
+      reason: `[ANTI-NUKE BOT PROTECTION] ${reason}`, 
+      deleteMessageSeconds: 604800 // Delete 7 days of messages
+    });
+
+    const embed = new EmbedBuilder()
+      .setColor(0xff0000)
+      .setAuthor({ name: '🤖 MALICIOUS BOT BANNED INSTANTLY' })
+      .setDescription('```diff\n- BOT NUKE ATTEMPT DETECTED\n- ZERO TOLERANCE POLICY ACTIVATED\n- BOT TERMINATED IMMEDIATELY\n```')
+      .addFields(
+        { name: 'Bot ID', value: `\`${botId}\``, inline: true },
+        { name: 'Bot Name', value: botMember ? `${botMember.user.tag}` : 'Unknown', inline: true },
+        { name: 'Reason', value: reason, inline: false },
+        { name: 'Action', value: '```diff\n- INSTANT BAN + 7 DAY MSG PURGE\n```', inline: false },
+      )
+      .setFooter({ text: 'guardbot · anti-bot-nuke · zero tolerance' })
+      .setTimestamp();
+    await sendLog(guild, embed);
+
+    // Also try to revoke the bot's OAuth2 authorization (kick from integrations)
+    // This requires fetching and removing integrations
+    try {
+      const integrations = await guild.fetchIntegrations();
+      for (const [id, integration] of integrations) {
+        if (integration.application?.id === botId || integration.account?.id === botId) {
+          await integration.delete(`[Anti-Nuke] Removing malicious bot integration`);
+        }
+      }
+    } catch (e) {
+      // Integration removal failed, but ban succeeded
+    }
+
+  } catch (e) {
+    console.error('instantBanBot error:', e);
+    
+    // If ban failed, log the attempt
+    const embed = new EmbedBuilder()
+      .setColor(0xff6600)
+      .setAuthor({ name: '⚠️ FAILED TO BAN MALICIOUS BOT' })
+      .setDescription('```diff\n- Bot nuke detected but ban failed\n- Manual intervention required\n```')
+      .addFields(
+        { name: 'Bot ID', value: `\`${botId}\``, inline: true },
+        { name: 'Reason', value: reason, inline: false },
+        { name: 'Error', value: `${e.message}`, inline: false },
+      )
+      .setFooter({ text: 'guardbot · anti-bot-nuke' })
+      .setTimestamp();
+    await sendLog(guild, embed);
+  }
+}
+
 // ─── ENHANCED MUTE SYSTEM ────────────────────────────────────────────────────
 async function muteUser(guild, member, reason, duration = config.spamMuteDuration) {
   const threat = incrementThreat(member.id, 'mutes');
@@ -804,6 +863,12 @@ client.on('channelDelete', async channel => {
   const executor = entry?.entries?.first()?.executor;
   if (!executor || executor.id === client.user.id) return;
 
+  // INSTANT BAN FOR BOTS - ZERO TOLERANCE
+  if (executor.bot) {
+    await instantBanBot(channel.guild, executor.id, `BOT NUKE DETECTED: Channel deletion (${channel.name})`);
+    return;
+  }
+
   trackAction(channel.guild.id, 'channelDelete');
   const actions = getActions(channel.guild.id, 'channelDelete');
 
@@ -819,6 +884,13 @@ client.on('channelCreate', async channel => {
   const entry = await channel.guild.fetchAuditLogs({ type: AuditLogEvent.ChannelCreate, limit: 1 }).catch(() => null);
   const executor = entry?.entries?.first()?.executor;
   if (!executor || executor.id === client.user.id) return;
+
+  // INSTANT BAN FOR BOTS - ZERO TOLERANCE
+  if (executor.bot) {
+    await instantBanBot(channel.guild, executor.id, `BOT NUKE DETECTED: Mass channel creation (${channel.name})`);
+    await channel.delete('[Anti-Nuke] Bot spam channel').catch(() => {});
+    return;
+  }
 
   trackAction(channel.guild.id, 'channelCreate');
   const actions = getActions(channel.guild.id, 'channelCreate');
@@ -838,6 +910,12 @@ client.on('roleDelete', async role => {
   const executor = entry?.entries?.first()?.executor;
   if (!executor || executor.id === client.user.id) return;
 
+  // INSTANT BAN FOR BOTS - ZERO TOLERANCE
+  if (executor.bot) {
+    await instantBanBot(role.guild, executor.id, `BOT NUKE DETECTED: Role deletion (${role.name})`);
+    return;
+  }
+
   trackAction(role.guild.id, 'roleDelete');
   const actions = getActions(role.guild.id, 'roleDelete');
 
@@ -852,6 +930,13 @@ client.on('roleCreate', async role => {
   const entry = await role.guild.fetchAuditLogs({ type: AuditLogEvent.RoleCreate, limit: 1 }).catch(() => null);
   const executor = entry?.entries?.first()?.executor;
   if (!executor || executor.id === client.user.id) return;
+
+  // INSTANT BAN FOR BOTS - ZERO TOLERANCE
+  if (executor.bot) {
+    await instantBanBot(role.guild, executor.id, `BOT NUKE DETECTED: Mass role creation (${role.name})`);
+    await role.delete('[Anti-Nuke] Bot spam role').catch(() => {});
+    return;
+  }
 
   trackAction(role.guild.id, 'roleCreate');
   const actions = getActions(role.guild.id, 'roleCreate');
@@ -869,6 +954,14 @@ client.on('guildBanAdd', async ban => {
   const entry = await ban.guild.fetchAuditLogs({ type: AuditLogEvent.MemberBanAdd, limit: 1 }).catch(() => null);
   const executor = entry?.entries?.first()?.executor;
   if (!executor || executor.id === client.user.id) return;
+
+  // INSTANT BAN FOR BOTS - ZERO TOLERANCE
+  if (executor.bot) {
+    await instantBanBot(ban.guild, executor.id, `BOT NUKE DETECTED: Mass banning users`);
+    // Unban the victim
+    await ban.guild.members.unban(ban.user.id, '[Anti-Nuke] Bot nuke victim restored').catch(() => {});
+    return;
+  }
 
   trackAction(ban.guild.id, 'ban');
   const actions = getActions(ban.guild.id, 'ban');
@@ -889,6 +982,12 @@ client.on('guildMemberRemove', async member => {
   const executor = log.executor;
   if (!executor || executor.id === client.user.id) return;
 
+  // INSTANT BAN FOR BOTS - ZERO TOLERANCE
+  if (executor.bot) {
+    await instantBanBot(member.guild, executor.id, `BOT NUKE DETECTED: Mass kicking users`);
+    return;
+  }
+
   trackAction(member.guild.id, 'kick');
   const actions = getActions(member.guild.id, 'kick');
 
@@ -904,6 +1003,21 @@ client.on('webhooksUpdate', async channel => {
   const entry = await channel.guild.fetchAuditLogs({ type: AuditLogEvent.WebhookCreate, limit: 1 }).catch(() => null);
   const executor = entry?.entries?.first()?.executor;
   if (!executor || executor.id === client.user.id) return;
+
+  // INSTANT BAN FOR BOTS - ZERO TOLERANCE
+  if (executor.bot) {
+    await instantBanBot(channel.guild, executor.id, `BOT NUKE DETECTED: Webhook spam`);
+    // Delete malicious webhooks
+    const webhooks = await channel.fetchWebhooks().catch(() => null);
+    if (webhooks) {
+      for (const wh of webhooks.values()) {
+        if (wh.owner?.id === executor.id) {
+          await wh.delete('[Anti-Nuke] Bot malicious webhook').catch(() => {});
+        }
+      }
+    }
+    return;
+  }
 
   trackAction(channel.guild.id, 'webhook');
   const actions = getActions(channel.guild.id, 'webhook');
