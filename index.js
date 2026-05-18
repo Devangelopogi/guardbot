@@ -113,6 +113,9 @@ const quarantinedUsers = new Map();  // odding → { guildId, timestamp }
 const antiLinkEnabled = new Map();   // guildId → boolean (default ON)
 const antiMentionEnabled = new Map(); // guildId → boolean (default ON)
 const dmWarningsEnabled = new Map(); // guildId → boolean (default ON)
+const maintenanceMode = new Map();   // guildId → { enabled: boolean, expiry: timestamp }
+const trustedAdmins = new Map();     // guildId → Set<userId> - admins na pwede mag-ayos ng server
+const trustedBots = new Map();       // guildId → Set<botId> - trusted bots (music, etc)
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 function getLogChannel(guild) {
@@ -166,6 +169,45 @@ function isAntiMentionEnabled(guildId) {
 
 function isDmWarningsEnabled(guildId) {
   return dmWarningsEnabled.get(guildId) !== false;
+}
+
+// ─── MAINTENANCE MODE & TRUSTED USERS ────────────────────────────────────────
+function isMaintenanceMode(guildId) {
+  const maint = maintenanceMode.get(guildId);
+  if (!maint || !maint.enabled) return false;
+  // Check if expired
+  if (maint.expiry && Date.now() > maint.expiry) {
+    maintenanceMode.set(guildId, { enabled: false, expiry: null });
+    return false;
+  }
+  return true;
+}
+
+function isTrustedAdmin(guildId, userId) {
+  return trustedAdmins.get(guildId)?.has(userId) || false;
+}
+
+function isTrustedBot(guildId, botId) {
+  return trustedBots.get(guildId)?.has(botId) || false;
+}
+
+function shouldSkipAntiNuke(guild, executorId, executor) {
+  // Always skip for server owner
+  if (executorId === guild.ownerId) return true;
+  
+  // Skip if maintenance mode is on
+  if (isMaintenanceMode(guild.id)) return true;
+  
+  // Skip if user is whitelisted
+  if (isWhitelisted(guild, executorId)) return true;
+  
+  // Skip if trusted admin (human)
+  if (!executor?.bot && isTrustedAdmin(guild.id, executorId)) return true;
+  
+  // Skip if trusted bot
+  if (executor?.bot && isTrustedBot(guild.id, executorId)) return true;
+  
+  return false;
 }
 
 // ─── THREAT LEVEL SYSTEM ─────────────────────────────────────────────────────
@@ -863,7 +905,10 @@ client.on('channelDelete', async channel => {
   const executor = entry?.entries?.first()?.executor;
   if (!executor || executor.id === client.user.id) return;
 
-  // INSTANT BAN FOR BOTS - ZERO TOLERANCE
+  // Skip if trusted (owner, maintenance mode, whitelisted, trusted admin/bot)
+  if (shouldSkipAntiNuke(channel.guild, executor.id, executor)) return;
+
+  // INSTANT BAN FOR UNTRUSTED BOTS - ZERO TOLERANCE
   if (executor.bot) {
     await instantBanBot(channel.guild, executor.id, `BOT NUKE DETECTED: Channel deletion (${channel.name})`);
     return;
@@ -885,7 +930,10 @@ client.on('channelCreate', async channel => {
   const executor = entry?.entries?.first()?.executor;
   if (!executor || executor.id === client.user.id) return;
 
-  // INSTANT BAN FOR BOTS - ZERO TOLERANCE
+  // Skip if trusted (owner, maintenance mode, whitelisted, trusted admin/bot)
+  if (shouldSkipAntiNuke(channel.guild, executor.id, executor)) return;
+
+  // INSTANT BAN FOR UNTRUSTED BOTS - ZERO TOLERANCE
   if (executor.bot) {
     await instantBanBot(channel.guild, executor.id, `BOT NUKE DETECTED: Mass channel creation (${channel.name})`);
     await channel.delete('[Anti-Nuke] Bot spam channel').catch(() => {});
@@ -910,7 +958,10 @@ client.on('roleDelete', async role => {
   const executor = entry?.entries?.first()?.executor;
   if (!executor || executor.id === client.user.id) return;
 
-  // INSTANT BAN FOR BOTS - ZERO TOLERANCE
+  // Skip if trusted (owner, maintenance mode, whitelisted, trusted admin/bot)
+  if (shouldSkipAntiNuke(role.guild, executor.id, executor)) return;
+
+  // INSTANT BAN FOR UNTRUSTED BOTS - ZERO TOLERANCE
   if (executor.bot) {
     await instantBanBot(role.guild, executor.id, `BOT NUKE DETECTED: Role deletion (${role.name})`);
     return;
@@ -931,7 +982,10 @@ client.on('roleCreate', async role => {
   const executor = entry?.entries?.first()?.executor;
   if (!executor || executor.id === client.user.id) return;
 
-  // INSTANT BAN FOR BOTS - ZERO TOLERANCE
+  // Skip if trusted (owner, maintenance mode, whitelisted, trusted admin/bot)
+  if (shouldSkipAntiNuke(role.guild, executor.id, executor)) return;
+
+  // INSTANT BAN FOR UNTRUSTED BOTS - ZERO TOLERANCE
   if (executor.bot) {
     await instantBanBot(role.guild, executor.id, `BOT NUKE DETECTED: Mass role creation (${role.name})`);
     await role.delete('[Anti-Nuke] Bot spam role').catch(() => {});
@@ -955,7 +1009,10 @@ client.on('guildBanAdd', async ban => {
   const executor = entry?.entries?.first()?.executor;
   if (!executor || executor.id === client.user.id) return;
 
-  // INSTANT BAN FOR BOTS - ZERO TOLERANCE
+  // Skip if trusted (owner, maintenance mode, whitelisted, trusted admin/bot)
+  if (shouldSkipAntiNuke(ban.guild, executor.id, executor)) return;
+
+  // INSTANT BAN FOR UNTRUSTED BOTS - ZERO TOLERANCE
   if (executor.bot) {
     await instantBanBot(ban.guild, executor.id, `BOT NUKE DETECTED: Mass banning users`);
     // Unban the victim
@@ -982,7 +1039,10 @@ client.on('guildMemberRemove', async member => {
   const executor = log.executor;
   if (!executor || executor.id === client.user.id) return;
 
-  // INSTANT BAN FOR BOTS - ZERO TOLERANCE
+  // Skip if trusted (owner, maintenance mode, whitelisted, trusted admin/bot)
+  if (shouldSkipAntiNuke(member.guild, executor.id, executor)) return;
+
+  // INSTANT BAN FOR UNTRUSTED BOTS - ZERO TOLERANCE
   if (executor.bot) {
     await instantBanBot(member.guild, executor.id, `BOT NUKE DETECTED: Mass kicking users`);
     return;
@@ -1004,7 +1064,10 @@ client.on('webhooksUpdate', async channel => {
   const executor = entry?.entries?.first()?.executor;
   if (!executor || executor.id === client.user.id) return;
 
-  // INSTANT BAN FOR BOTS - ZERO TOLERANCE
+  // Skip if trusted (owner, maintenance mode, whitelisted, trusted admin/bot)
+  if (shouldSkipAntiNuke(channel.guild, executor.id, executor)) return;
+
+  // INSTANT BAN FOR UNTRUSTED BOTS - ZERO TOLERANCE
   if (executor.bot) {
     await instantBanBot(channel.guild, executor.id, `BOT NUKE DETECTED: Webhook spam`);
     // Delete malicious webhooks
@@ -1174,13 +1237,46 @@ const commands = [
   // Moderation
   {
     name: 'nuke',
-    description: '💣 Mass delete messages in channel',
+    description: 'Mass delete messages in channel',
     options: [{ name: 'amount', description: 'Number of messages (1-100)', type: 4, required: true }]
   },
   {
     name: 'slowmode',
-    description: '🐌 Set channel slowmode',
+    description: 'Set channel slowmode',
     options: [{ name: 'seconds', description: 'Slowmode duration (0 to disable)', type: 4, required: true }]
+  },
+  // Maintenance Mode & Trust System
+  {
+    name: 'maintenance',
+    description: 'Toggle maintenance mode - disables anti-nuke for admins',
+    options: [
+      { name: 'toggle', description: 'Enable or disable', type: 3, required: true, choices: [{ name: 'Enable (30 min)', value: 'on' }, { name: 'Disable', value: 'off' }] },
+      { name: 'duration', description: 'Duration in minutes (default 30)', type: 4, required: false }
+    ]
+  },
+  {
+    name: 'trustadmin',
+    description: 'Add admin to trusted list - immune to anti-nuke detection',
+    options: [{ name: 'user', description: 'Admin to trust', type: 6, required: true }]
+  },
+  {
+    name: 'untrustadmin',
+    description: 'Remove admin from trusted list',
+    options: [{ name: 'user', description: 'Admin to untrust', type: 6, required: true }]
+  },
+  {
+    name: 'trustbot',
+    description: 'Add bot to trusted list - immune to anti-nuke detection',
+    options: [{ name: 'bot', description: 'Bot to trust (music bot, etc)', type: 6, required: true }]
+  },
+  {
+    name: 'untrustbot',
+    description: 'Remove bot from trusted list',
+    options: [{ name: 'bot', description: 'Bot to untrust', type: 6, required: true }]
+  },
+  {
+    name: 'trustlist',
+    description: 'Show all trusted admins and bots',
   },
 ];
 
@@ -1518,6 +1614,107 @@ client.on('interactionCreate', async interaction => {
     const seconds = interaction.options.getInteger('seconds');
     await interaction.channel.setRateLimitPerUser(seconds).catch(() => {});
     return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x1a1a2e).setDescription(`\`\`\`diff\n${seconds > 0 ? '-' : '+'} Slowmode set to ${seconds}s\n\`\`\``).setTimestamp()] });
+  }
+
+  // /maintenance - Temporarily disable anti-nuke for server organizing
+  if (commandName === 'maintenance') {
+    const val = interaction.options.getString('toggle') === 'on';
+    const duration = interaction.options.getInteger('duration') || 30; // Default 30 minutes
+
+    if (val) {
+      const expiry = Date.now() + (duration * 60 * 1000);
+      maintenanceMode.set(guild.id, { enabled: true, expiry });
+      
+      const embed = new EmbedBuilder()
+        .setColor(0xffcc00)
+        .setAuthor({ name: 'MAINTENANCE MODE ENABLED' })
+        .setDescription('```fix\nAnti-nuke protection temporarily disabled\nAdmins can now reorganize the server safely\n```')
+        .addFields(
+          { name: 'Duration', value: `${duration} minutes`, inline: true },
+          { name: 'Expires', value: `<t:${Math.floor(expiry / 1000)}:R>`, inline: true },
+        )
+        .setFooter({ text: 'Use /maintenance off to disable early' })
+        .setTimestamp();
+      
+      await sendLog(guild, embed);
+      return interaction.reply({ embeds: [embed] });
+    } else {
+      maintenanceMode.set(guild.id, { enabled: false, expiry: null });
+      return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x00ff00).setDescription('```diff\n+ Maintenance mode DISABLED\n+ Anti-nuke protection restored\n```').setTimestamp()] });
+    }
+  }
+
+  // /trustadmin - Add admin to trusted list
+  if (commandName === 'trustadmin') {
+    const user = interaction.options.getUser('user');
+    const targetMember = await guild.members.fetch(user.id).catch(() => null);
+    
+    if (!targetMember) return interaction.reply({ content: 'User not found.', ephemeral: true });
+    if (!targetMember.permissions.has(PermissionFlagsBits.Administrator)) {
+      return interaction.reply({ content: 'User must be an administrator.', ephemeral: true });
+    }
+    
+    if (!trustedAdmins.has(guild.id)) trustedAdmins.set(guild.id, new Set());
+    trustedAdmins.get(guild.id).add(user.id);
+    
+    const embed = new EmbedBuilder()
+      .setColor(0x00ff00)
+      .setDescription(`\`\`\`diff\n+ ${user.tag} added to trusted admins\n+ Immune to anti-nuke detection\n\`\`\``)
+      .setFooter({ text: 'Trusted admins can reorganize server without triggering alerts' })
+      .setTimestamp();
+    return interaction.reply({ embeds: [embed] });
+  }
+
+  // /untrustadmin - Remove admin from trusted list
+  if (commandName === 'untrustadmin') {
+    const user = interaction.options.getUser('user');
+    trustedAdmins.get(guild.id)?.delete(user.id);
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xff6600).setDescription(`\`\`\`diff\n- ${user.tag} removed from trusted admins\n\`\`\``).setTimestamp()] });
+  }
+
+  // /trustbot - Add bot to trusted list (music bots, etc)
+  if (commandName === 'trustbot') {
+    const bot = interaction.options.getUser('bot');
+    
+    if (!bot.bot) return interaction.reply({ content: 'Target must be a bot.', ephemeral: true });
+    
+    if (!trustedBots.has(guild.id)) trustedBots.set(guild.id, new Set());
+    trustedBots.get(guild.id).add(bot.id);
+    
+    const embed = new EmbedBuilder()
+      .setColor(0x00ff00)
+      .setDescription(`\`\`\`diff\n+ ${bot.tag} added to trusted bots\n+ Will NOT be banned for admin actions\n\`\`\``)
+      .setFooter({ text: 'Only trust bots you verified! Compromised bots can still nuke.' })
+      .setTimestamp();
+    return interaction.reply({ embeds: [embed] });
+  }
+
+  // /untrustbot - Remove bot from trusted list
+  if (commandName === 'untrustbot') {
+    const bot = interaction.options.getUser('bot');
+    trustedBots.get(guild.id)?.delete(bot.id);
+    return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xff6600).setDescription(`\`\`\`diff\n- ${bot.tag} removed from trusted bots\n- Will be banned instantly for nuke attempts\n\`\`\``).setTimestamp()] });
+  }
+
+  // /trustlist - Show all trusted admins and bots
+  if (commandName === 'trustlist') {
+    const admins = trustedAdmins.get(guild.id) || new Set();
+    const bots = trustedBots.get(guild.id) || new Set();
+    const wl = whitelist.get(guild.id) || new Set();
+    const maint = maintenanceMode.get(guild.id);
+    
+    const embed = new EmbedBuilder()
+      .setColor(0x1a1a2e)
+      .setAuthor({ name: 'TRUSTED USERS & SETTINGS' })
+      .addFields(
+        { name: 'Maintenance Mode', value: isMaintenanceMode(guild.id) ? `\`\`\`diff\n- ACTIVE (expires <t:${Math.floor(maint.expiry / 1000)}:R>)\n\`\`\`` : '```diff\n+ INACTIVE\n```', inline: false },
+        { name: 'Trusted Admins', value: admins.size > 0 ? [...admins].map(id => `<@${id}>`).join('\n') : 'None', inline: true },
+        { name: 'Trusted Bots', value: bots.size > 0 ? [...bots].map(id => `<@${id}>`).join('\n') : 'None', inline: true },
+        { name: 'Whitelisted Users', value: wl.size > 0 ? [...wl].map(id => `<@${id}>`).join('\n') : 'None', inline: true },
+      )
+      .setFooter({ text: 'Trusted users are immune to anti-nuke detection' })
+      .setTimestamp();
+    return interaction.reply({ embeds: [embed] });
   }
 });
 
